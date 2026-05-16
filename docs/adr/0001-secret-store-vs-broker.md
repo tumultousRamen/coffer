@@ -1,8 +1,5 @@
 # ADR 0001 — Secret Store vs. Credential Broker
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
 ## Context
 
 The vault delivers credentials to transfer workers at transfer time. Two fundamentally different models are possible:
@@ -12,7 +9,7 @@ The vault delivers credentials to transfer workers at transfer time. Two fundame
 
 The broker model is materially more secure: plaintext long-lived secrets never leave the vault, blast radius of a worker compromise is bounded to in-flight scoped tokens, and the story for classified/air-gapped customers is much stronger. The cost is per-provider broker logic (token-minting, refresh handling, retry semantics) and an extra hop on the read path that pressures the 200ms P99 budget.
 
-The brief, KPI, and whiteboard all presume the secret-store shape (`GetCredentials` returning a secret payload, P99 200ms fetch). The work-trial time-box does not accommodate building correct provider-specific broker logic across S3, Dropbox, Google Drive, and Box.
+The brief, KPI, and whiteboard all presume the secret-store shape (`GetCredentials` returning a secret payload, P99 200ms fetch). The work-trial time-box might not accommodate building correct provider-specific broker logic across S3, Dropbox, Google Drive, and Box.
 
 ## Decision
 

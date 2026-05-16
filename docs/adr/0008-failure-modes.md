@@ -1,10 +1,5 @@
 # ADR 0008 — Failure Modes & Availability
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
-
 The vault is on the critical path for all transfers — when it's down, transfers fail. The non-functional requirement isn't "never go down" (impossible), it's "fail gracefully and minimize the blast radius of dependency outages." Four failure surfaces need explicit decisions:
 
 1. AWS KMS outage (regional AWS issue, transient throttling, network partition to KMS).

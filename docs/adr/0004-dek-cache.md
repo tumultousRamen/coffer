@@ -1,10 +1,5 @@
 # ADR 0004 — DEK Cache Design
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
-
 [ADR 0003](0003-envelope-encryption-shape.md) commits to per-tenant DEKs with caching, but did not specify where they live. The choice matters because the cache is a copy of plaintext key material — the more places it lives, the larger the attack surface.
 
 Options:

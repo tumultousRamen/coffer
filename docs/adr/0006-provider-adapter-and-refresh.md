@@ -1,10 +1,5 @@
 # ADR 0006 — Provider Adapter & OAuth Refresh Strategy
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
-
 S3 credentials are static; OAuth credentials (Dropbox, Google Drive, Box) expire and must be refreshed using a long-lived refresh token. The 200ms P99 read budget cannot absorb a synchronous call to a third-party OAuth endpoint (Dropbox/Google `/oauth/token` P99 is often >800ms). Refresh must therefore happen out-of-band so that `GetCredentials` is always a fast read of an already-fresh token.
 
 Refresh-policy options considered:

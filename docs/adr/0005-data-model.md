@@ -1,9 +1,5 @@
 # ADR 0005 — Data Model & Schema
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
 
 Credentials have **fundamentally different shapes across providers** — S3 is `{access_key_id, secret_access_key}` plus `region`; OAuth providers (Dropbox, Google Drive, Box) are `{refresh_token, access_token, access_token_expires_at}` plus `scopes` and `account_email`. The schema must accommodate this without forcing a migration per provider and without forcing KMS decrypts to read non-secret config.
 

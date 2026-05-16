@@ -1,10 +1,5 @@
 # ADR 0010 — Modular & Replaceable Boundaries
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
-
 The brief's loudest signal is that Byteport must be able to extract this service and integrate it into their production system with minimal coupling. "Modular and replaceable" needs concrete boundaries — not a slogan. Three things have to be true:
 
 1. The **code** is structured so that infrastructure dependencies (KMS, DB, providers, telemetry) are behind small interfaces that Byteport can re-implement.

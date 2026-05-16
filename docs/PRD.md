@@ -1,11 +1,5 @@
 # PRD — coffer (credentials vault microservice)
 
-**Status:** Draft — being built up live via grilling session.
-**Owner:** Divya
-**Context:** Byteport work trial deliverable.
-
----
-
 ## 1. Problem
 
 Byteport's DART transfer protocol moves files between external storage providers (S3, Dropbox, Google Drive, Box, etc.) on behalf of customers. To do this, transfer workers need authenticated access to those storage accounts. Customers must be able to register their credentials with Byteport once, then trust that workers can use them at transfer time without ever exposing the raw secret back to the user or leaking it from the database.
@@ -46,7 +40,7 @@ System must:
 3. **Low latency.** Workers must not block. P99 200ms end-to-end for `GetCredentials`.
 4. **Modular / replaceable.** Byteport must be able to lift this into their production stack with minimal coupling — clean ports for KMS, DB, and gateway.
 
-## 5. Tech Stack (mandated)
+## 5. Tech Stack
 
 - **Language:** Go
 - **Service interface:** gRPC (worker-facing) + minimal REST gateway (user-facing)
@@ -55,7 +49,7 @@ System must:
 - **Supporting (optional):** Redis cache, refresh queue
 - **Observability:** OpenTelemetry → Grafana
 
-## 6. Out of Scope (per brief)
+## 6. Out of Scope
 
 - Worker / transfer-worker nodes.
 - Byteport's real production API gateway stack (dummy gateway is sufficient).
@@ -82,7 +76,7 @@ See [docs/adr/](adr/). Each load-bearing decision is captured as a numbered ADR.
 
 ## 8. Production Evolution
 
-Items deliberately deferred, captured here so a future maintainer (or reviewer) can see the shape of what we'd build next:
+Items deliberately deferred, captured here so a future maintainer can see the shape of what we'd build next:
 
 - **Full broker model.** Move S3 onto STS-issued temporary credentials so plaintext long-lived keys never reach workers ([ADR 0001](adr/0001-secret-store-vs-broker.md)).
 - **Sharded refresh workers.** Hash by `user_id` and run N worker pools when OAuth credentials exceed ~10M ([ADR 0006](adr/0006-provider-adapter-and-refresh.md)).

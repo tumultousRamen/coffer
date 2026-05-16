@@ -1,10 +1,5 @@
 # ADR 0007 — API Surface (gRPC + REST Gateway)
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
-
 Two API surfaces:
 1. **Worker-facing gRPC** — called by transfer workers at job time. Hot path. Bound by the 200ms P99 KPI.
 2. **User-facing REST** — called by Byteport's product UI / SDK. Manages credential lifecycle. Routed through the minimal API gateway.

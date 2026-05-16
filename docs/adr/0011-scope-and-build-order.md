@@ -1,10 +1,5 @@
 # ADR 0011 — Scope & Build Order (Work-Trial Plan)
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
-
 The work-trial deliverable spans the full design across ADRs 0001–0010. A naive build of everything in those ADRs is ~6 working days. The realistic time budget is ~19 hours of focused work spread across Thu 2026-05-14 → Wed 2026-05-20, with Monday hard-blocked. Modules are implemented test-driven with an AI coding assistant; human time goes to test design, infrastructure setup, integration debugging, and review.
 
 This ADR pins the scope cuts and the day-by-day build order.

@@ -1,10 +1,5 @@
 # ADR 0003 — Envelope Encryption Shape
 
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
-
 Credentials must be encrypted at rest such that a Postgres compromise alone cannot recover plaintext. We use **envelope encryption** with AWS KMS: a KEK (Key Encryption Key) lives in KMS and never leaves; DEKs (Data Encryption Keys) encrypt the actual secret bytes; the DB stores ciphertext + the KMS-encrypted DEK.
 
 The load-bearing choice is **DEK granularity**: one DEK per credential, one per tenant, or one per epoch.
@@ -13,7 +8,6 @@ The load-bearing choice is **DEK granularity**: one DEK per credential, one per 
 |---|---|---|---|
 | A. Per-credential DEK | 1 `Decrypt` every read | 1 credential | Poor (5M keys) |
 | B. Per-tenant DEK | 0 (cache hit), 1 on cold miss | ≤5 credentials, one user | Strong (1M keys, smaller hot set) |
-| C. Single global DEK | 0 | Entire vault | N/A — unacceptable |
 
 KMS `Decrypt` is ~10–30ms within-region. The P99 200ms budget cannot tolerate a KMS round-trip on every read.
 
