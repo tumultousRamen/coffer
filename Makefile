@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy
+.PHONY: smoke smoke-negative smoke-cleanup tidy test check-imports check
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -26,3 +26,22 @@ smoke-cleanup:
 
 tidy:
 	go mod tidy
+
+# Run all Go tests. No infra required.
+test:
+	go test ./...
+
+# Enforce hexagonal one-way imports (ADR 0010 §1):
+# internal/vault is the core and must not import from internal/adapters
+# or internal/transport. Fails non-zero on any match.
+check-imports:
+	@matches=$$(grep -rE 'github.com/tumultousRamen/coffer/internal/(adapters|transport)' internal/vault || true); \
+	if [ -n "$$matches" ]; then \
+	  echo "FAIL: internal/vault imports forbidden package:"; \
+	  echo "$$matches"; \
+	  exit 1; \
+	fi; \
+	echo "imports OK: internal/vault is clean"
+
+# Aggregate gate run by the PR template.
+check: test check-imports
