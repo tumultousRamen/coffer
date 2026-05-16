@@ -1,9 +1,4 @@
-# ADR 0009 — Observability
-
-**Status:** Accepted
-**Date:** 2026-05-14
-
-## Context
+# ADR 0009 — Observabilitys
 
 The brief identifies observability as a nice-to-have signal that "the system needs replacement or scaling work" and specifies OpenTelemetry + Grafana as the stack. For a credentials vault, observability is also load-bearing for **security correctness** — secrets must never appear in any output, and reads should be auditable even though full auditability is officially de-scoped.
 

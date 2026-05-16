@@ -39,7 +39,3 @@ KMS `Decrypt` is ~10–30ms within-region. The P99 200ms budget cannot tolerate 
 - Cache design (ADR 0004).
 - KMS outage behavior (ADR 0008).
 - Whether per-credential DEKs should reappear for specific high-sensitivity providers — possible future ADR if a customer demands it.
-
-## A note on the whiteboard
-
-The original whiteboard sketch labeled the DEK algorithm "SHA256". SHA-256 is a hash function, not a cipher, and has no role in this design. The intended algorithm — and the one accepted here — is **AES-256-GCM** for the data path, with the KEK as an AWS KMS-managed symmetric CMK. Logged here to avoid the confusion resurfacing.

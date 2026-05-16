@@ -41,8 +41,6 @@ message Credential {
 - One authz check, one audit-log event keyed to `job_id` — clean and atomic.
 - A `(user_id, provider)` lookup model was rejected because users can have multiple credentials per provider (e.g. `prod_parley_bucket` and `dev_test_bucket` for S3). The grant must name specific IDs.
 
-This decision triggered the refinement of [ADR 0002](0002-worker-auth-capability-token.md) — the capability token now carries `credential_ids`, not `allowed_providers`.
-
 ### 2. User-facing REST gateway
 
 ```

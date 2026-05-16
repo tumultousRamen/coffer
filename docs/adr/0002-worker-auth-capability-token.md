@@ -1,6 +1,6 @@
 # ADR 0002 — Worker Authentication: Per-Job Capability Token
 
-The `GetCredentials` gRPC endpoint returns plaintext (per [ADR 0001](0001-secret-store-vs-broker.md)). Any caller who reaches it with believable identity gets a secret back. Authentication of the worker is therefore the most security-load-bearing surface in the system.
+The `GetCredentials` gRPC endpoint returns plaintext (per [ADR 0001](0001-secret-store-vs-broker.md)). Any caller who reaches it with believable identity gets a secret back. Authentication of the worker is therefore a critical security-load-bearing surface in the system.
 
 Options considered:
 

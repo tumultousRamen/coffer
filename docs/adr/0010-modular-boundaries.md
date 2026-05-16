@@ -98,6 +98,7 @@ Cutover model: the destination vault is configured with the new `COFFER_AWS_KMS_
 **Implications:**
 - The `Telemetry` port (per ADR 0009) joins `KeyManager`, `CredentialStore`, and `Provider` as one of the four core abstractions. Calling code never imports OTel, the logger, or AWS SDK directly.
 - The repo structure is the first thing a reviewer will look at. The hexagonal layout signals architectural intent before any code is read.
+- **The `Provider` port is intrinsically broker-shaped.** Its `Refresh()` method is the mint primitive — for OAuth providers it calls `/oauth/token`; for a future S3-STS adapter it would call `AssumeRole`; for any new short-lived-token-issuing provider it implements the same shape (per [ADR 0001](0001-secret-store-vs-broker.md)). Moving a provider from secret-store mode to broker mode is therefore a single-file change.
 
 ## Out of scope here
 

@@ -1,38 +1,44 @@
 # ADR 0001 — Secret Store vs. Credential Broker
 
+**Status:** Accepted
+**Date:** 2026-05-14
+
 ## Context
 
-The vault delivers credentials to transfer workers at transfer time. Two fundamentally different models are possible:
+Two conceptual models for delivering credentials to transfer workers:
 
-1. **Secret store.** Worker calls `GetCredentials(user_id, provider)`; vault returns the **plaintext** secret over a mutually-authenticated channel; worker uses the plaintext to call S3/Dropbox/etc.
-2. **Credential broker.** Worker never sees the long-lived secret. Vault either (a) mints a short-lived scoped token on demand (STS AssumeRole for S3, fresh OAuth access token minted from a stored refresh token for Dropbox/GDrive), or (b) acts as a signing proxy.
+- **Secret store** — vault returns the long-lived plaintext secret; worker uses it directly against the storage provider.
+- **Credential broker** — long-lived secret never leaves the vault; vault returns a short-lived, scope-limited token minted from it.
 
-The broker model is materially more secure: plaintext long-lived secrets never leave the vault, blast radius of a worker compromise is bounded to in-flight scoped tokens, and the story for classified/air-gapped customers is much stronger. The cost is per-provider broker logic (token-minting, refresh handling, retry semantics) and an extra hop on the read path that pressures the 200ms P99 budget.
+Broker is materially safer: a compromised worker's blast radius is bounded by the short-lived token's TTL, not by the long-lived secret's lifetime. The catch is that broker mode requires a per-provider "mint" primitive — STS `AssumeRole` for S3, OAuth `/oauth/token` refresh for Dropbox / Google Drive / Box, etc. Building that across every provider is expensive.
 
-The brief, KPI, and whiteboard all presume the secret-store shape (`GetCredentials` returning a secret payload, P99 200ms fetch). The work-trial time-box might not accommodate building correct provider-specific broker logic across S3, Dropbox, Google Drive, and Box.
+The earlier framing of this ADR treated the choice as service-wide. That was wrong. **The choice is per-provider**, and it falls out cleanly from whether the provider's protocol gives us a short-lived-token primitive for free.
 
 ## Decision
 
-Commit to the **secret-store model** for the work-trial deliverable.
+**The vault is architecturally a credential broker.** Per-provider mode is determined by what the protocol provides.
 
-For OAuth-based providers (Dropbox, Google Drive, Box), the vault will refresh access tokens server-side and return the **current access token** (not the refresh token) to workers. This is functionally a broker pattern for OAuth providers — the long-lived refresh token never leaves the vault — without paying the cost of full per-provider broker abstractions on the static-key path.
+| Provider | Stored (long-lived) | Returned to worker | Mode |
+|---|---|---|---|
+| Dropbox | `refresh_token` | `access_token` (~4h TTL) | Broker |
+| Google Drive | `refresh_token` | `access_token` (~1h TTL) | Broker |
+| Box | `refresh_token` (60-day) | `access_token` (~1h TTL) | Broker |
+| **S3 (trial scope)** | `access_key_id` + `secret_access_key` | same (long-lived) | **Secret-store** |
+| S3 (production evolution) | IAM role / root key | STS temporary credentials (15min–12h) | Broker |
 
-For static-key providers (S3 access keys), the vault returns the stored plaintext key.
+For OAuth providers, broker mode comes for free — the refresh-token flow is the mint primitive, and the vault's refresh worker (ADR 0006) is the mint implementation. Long-lived refresh tokens never leave the vault; workers only ever receive short-lived access tokens.
+
+S3 is the single hold-out — AWS access-key auth has no built-in short-lived primitive, and we have not built the STS adapter for this trial. S3 therefore operates in secret-store mode as a deliberate fallback.
+
+The `Provider` port (ADR 0010) is intrinsically broker-shaped: its `Refresh()` method is the mint function. Adding broker mode to a new provider = implementing that one method.
 
 ## Consequences
 
-**Accepted trade-offs:**
-- Workers hold plaintext long-lived secrets in memory for the duration of a transfer for static-key providers. Mitigated by mTLS on the gRPC link, short-lived worker process memory, and worker-side discipline (never log, never persist).
-- The PRD must articulate the production evolution: full broker model with STS-based scoped tokens for S3, eliminating long-lived plaintext on workers entirely.
+- **Today's security posture** is broker for 3 of 4 providers. A compromised worker that touched an OAuth credential only exfiltrates a short-lived access token; long-lived refresh tokens are unreachable.
+- **The remaining gap** is S3 in secret-store mode. Production evolution is narrowly scoped: add an STS-based adapter behind the existing `Provider` port. No other code changes.
+- **Caveat — token TTL varies.** Dropbox / GDrive access tokens (~1–4h) are well-bounded brokered tokens. Box refresh tokens valid 60 days are a softer guarantee; the mint cadence still bounds blast radius but less aggressively than STS (15min–12h). Worth honest naming in the writeup.
+- **Audit log** records every read with `job_id`, `credential_id`, `provider`, `outcome` — works identically for broker and secret-store modes (ADR 0009).
 
-**Implications for downstream design:**
-- The gRPC `GetCredentials` response includes plaintext.
-- Per-provider validators and refresh logic need a clean provider-adapter port (see future ADR on provider abstraction).
-- Caching design (see future ADR) must reason about plaintext residency.
-- Audit log must record every plaintext read with caller identity (even though "auditability" is officially out of scope, the read-path log is cheap and high-value).
+## Production evolution
 
-## Production evolution path
-
-1. Add an STS-based broker adapter for S3 — workers receive temporary credentials, never the root key.
-2. Generalize provider adapters to expose a `MintCredential` method that can return either plaintext (current behavior) or a scoped token.
-3. Deprecate plaintext return paths provider-by-provider behind a feature flag.
+Add an S3-STS adapter that swaps the stored long-lived key for STS-minted temporary credentials on each `GetCredentials` call. The capability token's `job_id` is the natural session-name to bind STS calls against. After this, the vault is broker mode end-to-end.
