@@ -47,6 +47,7 @@ CREATE INDEX        credentials_user_provider       ON credentials (user_id, pro
 | Tenancy | `user_id` only | Brief specifies "1M users, 5 creds per user". `org_id` is purely additive later — no preemptive column. |
 | Row-Level Security (RLS) | **Not used** | The vault service is the sole DB consumer; authz lives at the service layer against the capability token. RLS would add `SET LOCAL` overhead on every query, complicate connection pooling, and provide redundant defense at material complexity cost. |
 | Delete semantics | **Hard delete** on user-initiated DELETE | A user revoking a credential expects the ciphertext gone. Crypto-shred at the tenant level is handled by DEK retirement (ADR 0003). |
+| Migration tool | `golang-migrate/migrate` | Plain SQL `.up.sql` / `.down.sql` files under `internal/adapters/postgres/migrations/`. Embedded into the binary via `//go:embed` and run on boot. No ORM. Compatible with Supabase out of the box. |
 
 ## Consequences
 

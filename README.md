@@ -1,11 +1,13 @@
 # coffer
 
-Credentials vault microservice — Byteport work trial.
+Credentials vault microservice
 
 A Go/gRPC service that stores customer credentials for external storage providers (S3, Dropbox, Google Drive, Box) and delivers them to transfer workers at transfer time. Encrypted at rest with envelope encryption (AWS KMS), designed for modular, replaceable deployment so Byteport can extract it into their production system.
 
 - [PRD](docs/PRD.md)
 - [ADRs](docs/adr/)
+- [Threat Model](docs/THREAT_MODEL.md)
+- [KMS Runbook](docs/RUNBOOK_KMS.md)
 
 ---
 
@@ -18,9 +20,8 @@ flowchart LR
     CP([Control Plane<br/>capability-token minter<br/><i>out of scope</i>])
 
     subgraph coffer["coffer (this repo)"]
-        Gateway["REST Gateway<br/>JWT • rate-limit • idempotency"]
-        Vault["Vault Service<br/>Go • gRPC"]
-        Refresh["Refresh Worker<br/>leader-elected"]
+        Gateway["cmd/gateway<br/>JWT • rate-limit • idempotency"]
+        Vault["cmd/vault<br/>gRPC + REST<br/><i>refresh worker (in-process)</i>"]
     end
 
     PG[("Postgres<br/>Supabase")]
@@ -29,18 +30,18 @@ flowchart LR
     OAuthP([OAuth Providers<br/>Dropbox / GDrive / Box])
 
     User -->|HTTPS + JWT| Gateway
-    Gateway -->|internal gRPC| Vault
+    Gateway -->|internal HTTP<br/>X-User-Id| Vault
+    Gateway --> Redis
     CP -.->|signs job grants| Worker
     Worker -->|gRPC + capability token| Vault
 
     Vault --> PG
     Vault --> KMS
     Vault --> Redis
-    Refresh --> PG
-    Refresh -->|refresh tokens| OAuthP
+    Vault -.->|refresh worker| OAuthP
 ```
 
-Two clients of the vault: **users** (manage credentials via REST), **workers** (fetch credentials at transfer time via gRPC). The control plane mints per-job capability tokens that scope what a worker can fetch. See [ADR 0001](docs/adr/0001-secret-store-vs-broker.md), [ADR 0002](docs/adr/0002-worker-auth-capability-token.md).
+Two clients of the vault: **users** (manage credentials via REST through the gateway), **workers** (fetch credentials at transfer time via gRPC, direct). The control plane mints per-job capability tokens that scope what a worker can fetch. The refresh worker runs as a leader-elected goroutine pool **inside the vault binary** — not a separate process. See [ADR 0001](docs/adr/0001-secret-store-vs-broker.md), [ADR 0002](docs/adr/0002-worker-auth-capability-token.md), [ADR 0006](docs/adr/0006-provider-adapter-and-refresh.md).
 
 ---
 
@@ -85,7 +86,8 @@ sequenceDiagram
     participant U as User
     participant V as Vault
     participant DB as Postgres
-    participant R as Refresh Worker<br/>(leader-elected)
+    participant R as Refresh Worker<br/>(in-process, leader-elected)
+    participant K as AWS KMS
     participant P as OAuth Provider
 
     U->>V: POST /v1/credentials (Dropbox)
@@ -100,11 +102,15 @@ sequenceDiagram
         R->>P: POST /oauth/token (refresh_token)
         alt 200 OK
             P-->>R: new access_token (+ maybe new refresh_token)
+            R->>K: Decrypt(encrypted_dek)<br/>(only if not cached)
+            K-->>R: plaintext DEK
             R->>DB: BEGIN<br/>UPDATE credentials (re-encrypt)<br/>UPDATE refresh_jobs (run_at = new_expires - X)<br/>COMMIT
         else 4xx invalid_grant
             R->>DB: UPDATE credentials status='failed'<br/>DELETE refresh_jobs row
-        else 5xx / network
+        else 5xx / network (attempts < max)
             R->>DB: UPDATE refresh_jobs attempts++<br/>backoff run_at
+        else 5xx / network (attempts >= max)
+            R->>DB: UPDATE credentials status='failed'<br/>DELETE refresh_jobs row
         end
     end
 ```
@@ -119,6 +125,7 @@ sequenceDiagram
 flowchart TB
     subgraph cmd["cmd/"]
         Main["vault/main.go<br/>composition root"]
+        Gw["gateway/<br/>stub API gateway"]
         Migrate["coffer-migrate/<br/>data migration CLI"]
     end
 
@@ -147,6 +154,11 @@ flowchart TB
     Main --> Providers
     Main --> Tel
 
+    Gw -->|HTTP| Rest
+
+    Migrate --> AWS
+    Migrate --> PG
+
     Grpc --> Service
     Rest --> Service
     Service --> Ports
@@ -157,7 +169,7 @@ flowchart TB
     Tel -.implements.-> Ports
 ```
 
-**Dependency direction is one-way.** `internal/vault` (core) imports nothing in `internal/adapters` or `internal/transport`. Adapters implement the port interfaces defined by core. `cmd/vault/main.go` is the only place where adapters get wired into the core service.
+**Dependency direction is one-way.** `internal/vault` (core) imports nothing in `internal/adapters` or `internal/transport`. Adapters implement the port interfaces defined by core. `cmd/vault/main.go` is the only place where adapters get wired into the core service. The stub `cmd/gateway/` proxies HTTP into the vault's REST transport with JWT/idempotency middleware.
 
 Byteport can swap any adapter — KMS, DB, provider, telemetry — by replacing one folder and re-wiring `main.go`. The core lifts cleanly into their monorepo as a library. See [ADR 0010](docs/adr/0010-modular-boundaries.md).
 
@@ -170,10 +182,65 @@ Byteport can swap any adapter — KMS, DB, provider, telemetry — by replacing 
 | Language | Go |
 | Service interface | gRPC (worker-facing) + REST gateway (user-facing) |
 | Datastore | Postgres (Supabase-compatible) |
+| Migrations | `golang-migrate` with embedded SQL files |
 | Key management | AWS KMS (envelope encryption, per-tenant DEK, AES-256-GCM) |
 | Cache / supporting | Redis (rate limiting, OAuth access-token cache, idempotency keys) |
 | Observability | OpenTelemetry → Grafana |
 
+---
+
+## Local development
+
+Requires: Go 1.22+, Docker (for Postgres + Redis), AWS credentials (or skip with the `dev_no_kms` build tag), `protoc` or `buf` for regenerating gRPC bindings.
+
+```bash
+# 1. Clone and bring up local infra
+git clone https://github.com/<user>/coffer.git
+cd coffer
+docker compose up -d   # Postgres + Redis
+
+# 2. Configure env
+cp .env.example .env
+# Edit .env: set COFFER_PG_URL, KMS settings (or use dev_no_kms below)
+
+# 3. Run migrations
+go run ./cmd/coffer-migrate --migrate-only
+
+# 4. Run the vault (with real KMS)
+go run ./cmd/vault
+
+# 4b. Or run without AWS, using a file-based key for dev only
+go run -tags dev_no_kms ./cmd/vault
+
+# 5. Run the stub gateway in another terminal
+go run ./cmd/gateway
+
+# 6. Try it (against the gateway)
+curl -X POST localhost:8080/v1/credentials \
+  -H "Authorization: Bearer $(./scripts/mint-stub-jwt.sh)" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"provider":"s3","label":"demo","secret":{"access_key_id":"AKIA...","secret_access_key":"..."}}'
+```
+
+### Running the demo end-to-end
+
+```bash
+./demo/run.sh   # brings up infra, seeds creds, exercises worker fetch, refresh, and coffer-migrate
+```
+
+Demo script intentionally exercises every load-bearing path from the ADRs in under 7 minutes — see [ADR 0011](docs/adr/0011-scope-and-build-order.md).
+
+### Testing
+
+```bash
+go test ./...                     # all unit tests
+go test -tags integration ./...   # adds testcontainers-backed integration tests
+```
+
+Strict TDD applies to the core domain, crypto path, refresh state machine, and capability-token verification. Smoke tests cover the wiring. See [ADR 0011](docs/adr/0011-scope-and-build-order.md) §3.
+
+---
+
 ## Build & Demo
 
-See [ADR 0011](docs/adr/0011-scope-and-build-order.md) for the day-by-day build plan and the demo script (`demo/run.sh` — TBD).
+See [ADR 0011](docs/adr/0011-scope-and-build-order.md) for the day-by-day build plan and the demo script.
