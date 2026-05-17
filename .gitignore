@@ -1,0 +1,16 @@
+.agents/
+skills-lock.json
+scratch.md
+
+# Go
+*.exe
+*.test
+*.out
+/bin/
+
+# Env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store

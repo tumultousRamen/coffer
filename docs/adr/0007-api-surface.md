@@ -10,6 +10,8 @@ Both must encode the invariant from the brief: **users can register credentials 
 
 ### 1. Worker-facing gRPC — batch fetch
 
+Protobuf definitions live at `api/coffer/v1/vault.proto` and are compiled into `internal/transport/grpc/pb/` via `buf` (or `protoc` for the trial — toolchain choice can be revisited).
+
 ```protobuf
 service Vault {
   rpc GetCredentials(GetCredentialsRequest) returns (GetCredentialsResponse);

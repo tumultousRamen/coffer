@@ -12,8 +12,11 @@ The brief's loudest signal is that Byteport must be able to extract this service
 
 ```
 coffer/
+├── api/
+│   └── coffer/v1/vault.proto # gRPC service definition (per ADR 0007)
 ├── cmd/
-│   ├── vault/                # main: wires adapters into the core
+│   ├── vault/                # main: wires adapters into the core (gRPC + REST)
+│   ├── gateway/              # stub API gateway — JWT verify, rate-limit, idempotency
 │   └── coffer-migrate/       # one-shot migration CLI (data export/import)
 ├── internal/
 │   ├── vault/                # CORE — domain logic; defines port interfaces
@@ -22,7 +25,7 @@ coffer/
 │   │   └── ports.go          # KeyManager, CredentialStore, Provider, Telemetry interfaces
 │   ├── adapters/             # IMPL — one folder per port
 │   │   ├── awskms/           # KeyManager implementation
-│   │   ├── postgres/         # CredentialStore implementation
+│   │   ├── postgres/         # CredentialStore implementation + migrations/
 │   │   ├── providers/        # Provider implementations
 │   │   │   ├── s3.go
 │   │   │   ├── dropbox.go
@@ -30,10 +33,12 @@ coffer/
 │   │   │   └── box.go
 │   │   └── telemetry/        # Telemetry implementation (OTel + stdout audit)
 │   └── transport/            # protocol layer — consumes core, NEVER adapters
-│       ├── grpc/             # worker-facing service
-│       └── rest/             # user-facing gateway
+│       ├── grpc/             # worker-facing service (called directly by workers)
+│       └── rest/             # user-facing REST handlers (called by the gateway)
 └── docs/
 ```
+
+**Two binaries, one repo.** `cmd/vault/` is the core service exposing both gRPC (workers) and REST (gateway-proxied). `cmd/gateway/` is the thin user-facing edge that wraps the vault's REST transport with JWT verification, rate limiting, and idempotency-key handling — explicitly the "minimal API gateway scaffolding" called out in the brief. Reviewer / Byteport replaces it with their real Envoy/Fly edge in production; the seam is clean.
 
 **Dependency rules (enforced):**
 - `internal/vault` imports nothing in `internal/adapters` or `internal/transport`. One-way only.
