@@ -31,13 +31,16 @@ tidy:
 test:
 	go test -race ./...
 
-# Run integration tests that hit real Supabase. Requires DATABASE_URL.
-# Build tag `integration` keeps these out of the default `test` target.
-# Migrations are applied on startup by integration_test.go's TestMain.
+# Run integration tests against real infra. Each adapter is
+# self-gating:
+#   * awskms — t.Skip if AWS_PROFILE is unset
+#   * postgres — TestMain prints "DATABASE_URL not set; skipping" and
+#     exits 0 if DATABASE_URL is unset
+# So you can run a subset by exporting just one env var, or run both
+# with .env.local sourced below.
 integration:
 	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
-	  if [ -z "$$DATABASE_URL" ]; then echo "ENV: DATABASE_URL missing -- copy .env.local.example to .env.local"; exit 1; fi; \
-	  go test -tags integration -race ./internal/adapters/postgres/...'
+	  go test -tags integration -race ./internal/adapters/awskms/... ./internal/adapters/postgres/...'
 
 # Apply embedded migrations (creates tenants + credentials tables).
 migrate-up:
