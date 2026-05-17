@@ -122,3 +122,14 @@ Redis is already in the stack per [ADR 0004](0004-dek-cache.md) (rate limiting, 
 ## Update — PRD 0004 (2026-05-17)
 
 The "reject the whole request if any ID is unauthorized / missing" rule (§38 above) is **now enforced at the service layer**, not at the storage port. The `CredentialStore.Get` port contract returns whichever IDs exist and drops the rest — service-layer code is responsible for translating an incomplete result into the reject-whole API behavior described above. The contract is locked in by `portcontract.RunCredentialStoreContract`'s `GetMixedValidInvalidReturnsOnlyValid` scenario; the service-layer PRD must add the wrapper enforcement before any user-facing API ships.
+
+## Update — PRD 0005 (2026-05-17)
+
+The REST-side service methods listed in §2 are now implemented on `vault.Service` (`internal/vault/service.go`): `CreateCredential`, `ListCredentials`, `GetCredentialSummary`, `ReplaceCredential`, `DeleteCredential`. Behavior notes worth pinning:
+
+- **`GetCredentialSummary` is single-ID**, so the §38 "reject-whole on missing ID" rule does not apply on this path — a missing ID maps cleanly to `vault.ErrNotFound` → HTTP 404. The §38 enforcement is reserved for the worker-facing batch `FetchForWorker` flow that lands with capability tokens in the next PRD.
+- **`ReplaceCredential` fetches the existing row's `provider` and `label`** before re-encrypting. The AAD on AES-GCM is `userID || credentialID || provider` (ADR 0003); allowing the caller to change `provider` on Replace would change the AAD and brick the row. §5 already implied this; making it explicit because the service-layer code path is the place this invariant is now enforced.
+- **No `Idempotency-Key` handling in the service layer.** §4 is still a REST-gateway concern; the service is stateless on retries and the gateway will dedupe before calling.
+- **No `Provider.Validate` call at Create or Replace.** §2 expects it; deferred until the provider-adapter PRD lands. One-line addition at that time.
+
+The service layer is the call site for the future `Telemetry` and `Provider.Validate` hooks — both surfaces are kept clean in this PRD on purpose so neither lands prematurely.

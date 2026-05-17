@@ -46,18 +46,25 @@ func RunCredentialStoreContract(t *testing.T, factory Factory) {
 
 func provision(t *testing.T, b StoreBundle, userID string) {
 	t.Helper()
-	if err := b.Tenants.PutEncryptedDEK(context.Background(), userID, []byte("ciphertext-dek-stub")); err != nil {
+	if _, _, err := b.Tenants.PutEncryptedDEK(context.Background(), userID, []byte("ciphertext-dek-stub")); err != nil {
 		t.Fatalf("provision tenant %s: %v", userID, err)
 	}
 }
 
+// stubNonce is a deterministic 12-byte value used by contract tests to
+// assert nonce round-trip. Production code generates a fresh random
+// nonce per encrypt via Cryptor.
+var stubNonce = []byte{0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B}
+
 func newCred(id, provider, label, secret string) vault.Credential {
 	return vault.Credential{
-		ID:       id,
-		Provider: provider,
-		Label:    label,
-		Secret:   vault.NewSecretBlob([]byte(secret)),
-		Metadata: vault.Metadata{"region": "us-west-1"},
+		ID:         id,
+		Provider:   provider,
+		Label:      label,
+		Secret:     vault.NewSecretBlob([]byte(secret)),
+		Metadata:   vault.Metadata{"region": "us-west-1"},
+		Nonce:      append([]byte(nil), stubNonce...),
+		DEKVersion: 1,
 	}
 }
 
@@ -90,6 +97,12 @@ func testCreateThenGet(t *testing.T, b StoreBundle) {
 	}
 	if got[0].Metadata["region"] != "us-west-1" {
 		t.Errorf("Get metadata.region = %v, want us-west-1", got[0].Metadata["region"])
+	}
+	if !bytes.Equal(got[0].Nonce, stubNonce) {
+		t.Errorf("Get nonce = %x, want %x", got[0].Nonce, stubNonce)
+	}
+	if got[0].DEKVersion != 1 {
+		t.Errorf("Get DEKVersion = %d, want 1", got[0].DEKVersion)
 	}
 }
 
@@ -135,7 +148,11 @@ func testReplacePreservesCreatedAt(t *testing.T, b StoreBundle) {
 	}
 	createdAt := beforeList[0].CreatedAt
 
-	if err := b.Credentials.Replace(ctx, userID, newCred(credID, "s3", "p", "v2")); err != nil {
+	replaced := newCred(credID, "s3", "p", "v2")
+	freshNonce := []byte{0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B}
+	replaced.Nonce = freshNonce
+	replaced.DEKVersion = 1
+	if err := b.Credentials.Replace(ctx, userID, replaced); err != nil {
 		t.Fatalf("Replace: %v", err)
 	}
 	got, err := b.Credentials.Get(ctx, userID, []string{credID})
@@ -144,6 +161,9 @@ func testReplacePreservesCreatedAt(t *testing.T, b StoreBundle) {
 	}
 	if !bytes.Equal(got[0].Secret.Reveal(), []byte("v2")) {
 		t.Errorf("Get secret = %q, want v2", got[0].Secret.Reveal())
+	}
+	if !bytes.Equal(got[0].Nonce, freshNonce) {
+		t.Errorf("Get nonce after Replace = %x, want %x (storage must round-trip the fresh nonce)", got[0].Nonce, freshNonce)
 	}
 	afterList, err := b.Credentials.List(ctx, userID)
 	if err != nil {

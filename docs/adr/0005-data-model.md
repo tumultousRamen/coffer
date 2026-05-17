@@ -74,6 +74,17 @@ Two deferrals to flag for the service-layer PRD, both deliberate scope cuts in P
 
 Also: `CredentialStore.Get` returns whichever requested IDs exist and silently drops the rest, with no order guarantee. Order-of-IDs and reject-whole-on-miss are now service-layer concerns — see ADR 0007's PRD-0004 update for the reasoning.
 
+## Update — PRD 0005 (2026-05-17)
+
+Both PRD-0004 deferrals are now resolved:
+
+- **`credentials.nonce`** carries the fresh 12-byte AES-GCM nonce that the service layer's `Cryptor.Encrypt` produces on every Create and Replace. The `vault.Credential` type now has a `Nonce []byte` field that round-trips through both adapters.
+- **`credentials.dek_version`** carries the live `tenants.dek_version` as of the row's write time. `TenantStore.GetEncryptedDEK` was extended to return `(dek, version, err)`; the service stamps `version` onto the credential row in the same operation.
+
+One additional schema-adjacent decision that affected the storage layer: **`TenantStore.PutEncryptedDEK` is now load-or-store**, not upsert. First call inserts at `dek_version = 1` and returns the inserted DEK; subsequent calls return the existing `(encrypted_dek, dek_version)` and discard the caller's argument. This was needed to fix a concurrent first-credential race the original spec missed (two goroutines could each `Cryptor.Provision` and overwrite each other's DEK, leaving credentials encrypted under an orphaned DEK). DEK rotation, which previously would have used the same method to overwrite the DEK, will need its own explicit `RotateEncryptedDEK` method when that PRD lands — provisioning and rotation are now distinct entry points.
+
+The Postgres implementation uses `INSERT … ON CONFLICT (user_id) DO NOTHING RETURNING …` plus a fallback `SELECT` on the no-op path. Memstore uses a mutex-guarded "if exists return existing, else store new" check. Both are exercised by the `portcontract.TestPutSecondLoadsExisting` and `TestConcurrentPutExactlyOneCanonicalDEK` scenarios — adapter equivalence is preserved.
+
 ## On RLS specifically
 
 The default Supabase posture is RLS-on for every table. We deliberately disable it for `tenants` and `credentials`. The vault service connects to Postgres with a single dedicated role that has direct access. Authz is enforced **before** the query, against the per-job capability token (ADR 0002) — by the time a query is constructed, the user_id has already been authorized. RLS in this architecture would either be redundant (same check, twice) or actively wrong (would block legitimate cross-tenant work like the refresh queue).
