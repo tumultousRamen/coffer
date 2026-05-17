@@ -11,12 +11,11 @@ import (
 )
 
 // CredentialStore implements vault.CredentialStore against the
-// `credentials` table from ADR 0005.
-//
-// dek_version is sourced from the corresponding tenants row at write
-// time. Until the service-layer PRD lands, the adapter writes
-// dek_version = 1 (matching the initial PutEncryptedDEK insert) — the
-// next PRD will plumb the live version through.
+// `credentials` table from ADR 0005. Nonce and DEKVersion on the
+// vault.Credential round-trip through the storage path: the service
+// layer stamps them at write time, the adapter persists them, and
+// Get reads them back so the service can drive Cryptor.Decrypt with
+// the same nonce / under the same DEK epoch that sealed the row.
 type CredentialStore struct {
 	db *sql.DB
 }
@@ -34,7 +33,7 @@ func (s *CredentialStore) Get(ctx context.Context, userID string, ids []string) 
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, provider, label, secret_ciphertext, nonce, metadata
+		SELECT id, provider, label, secret_ciphertext, nonce, dek_version, metadata
 		FROM credentials
 		WHERE user_id = $1 AND id = ANY($2::uuid[])
 	`, userID, ids)
@@ -48,9 +47,10 @@ func (s *CredentialStore) Get(ctx context.Context, userID string, ids []string) 
 		var (
 			id, provider, label string
 			secret, nonce       []byte
+			dekVersion          int
 			metadataJSON        []byte
 		)
-		if err := rows.Scan(&id, &provider, &label, &secret, &nonce, &metadataJSON); err != nil {
+		if err := rows.Scan(&id, &provider, &label, &secret, &nonce, &dekVersion, &metadataJSON); err != nil {
 			return nil, fmt.Errorf("postgres: scan credential: %w", err)
 		}
 		md := vault.Metadata{}
@@ -59,13 +59,14 @@ func (s *CredentialStore) Get(ctx context.Context, userID string, ids []string) 
 				return nil, fmt.Errorf("postgres: unmarshal metadata for %s: %w", id, err)
 			}
 		}
-		_ = nonce // schema column; the Credential type gains nonce in the service-layer PRD
 		out = append(out, vault.Credential{
-			ID:       id,
-			Provider: provider,
-			Label:    label,
-			Secret:   vault.NewSecretBlob(secret),
-			Metadata: md,
+			ID:         id,
+			Provider:   provider,
+			Label:      label,
+			Secret:     vault.NewSecretBlob(secret),
+			Metadata:   md,
+			Nonce:      nonce,
+			DEKVersion: dekVersion,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -106,10 +107,6 @@ func (s *CredentialStore) List(ctx context.Context, userID string) ([]vault.Cred
 // Create inserts c. Maps Postgres unique-violation (PK collision on
 // id, or the unique index on (user_id, provider, label)) to
 // ErrAlreadyExists; FK violation on user_id to ErrTenantNotProvisioned.
-//
-// The schema's nonce column is NOT NULL; this PRD writes an empty
-// blob because the Credential type does not yet carry a nonce field.
-// The service-layer PRD reshapes the type and the call site together.
 func (s *CredentialStore) Create(ctx context.Context, userID string, c vault.Credential) error {
 	metadataJSON, err := json.Marshal(c.Metadata)
 	if err != nil {
@@ -125,7 +122,7 @@ func (s *CredentialStore) Create(ctx context.Context, userID string, c vault.Cre
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
 	`,
 		c.ID, userID, c.Provider, c.Label,
-		c.Secret.Reveal(), []byte{}, 1,
+		c.Secret.Reveal(), c.Nonce, c.DEKVersion,
 		string(metadataJSON), string(vault.StatusActive),
 	)
 	if err != nil {
@@ -149,11 +146,12 @@ func (s *CredentialStore) Replace(ctx context.Context, userID string, c vault.Cr
 		UPDATE credentials
 		SET secret_ciphertext = $1,
 		    nonce             = $2,
-		    metadata          = $3::jsonb,
+		    dek_version       = $3,
+		    metadata          = $4::jsonb,
 		    updated_at        = now()
-		WHERE id = $4 AND user_id = $5
+		WHERE id = $5 AND user_id = $6
 	`,
-		c.Secret.Reveal(), []byte{}, string(metadataJSON),
+		c.Secret.Reveal(), c.Nonce, c.DEKVersion, string(metadataJSON),
 		c.ID, userID,
 	)
 	if err != nil {

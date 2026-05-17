@@ -35,14 +35,26 @@ type CredentialStore interface {
 // TenantStore is the seam to the per-tenant DEK wrapper store
 // (Postgres `tenants` table in production; memstore in tests).
 //
-// GetEncryptedDEK returns ErrNotFound for a tenant that has never
-// been provisioned. PutEncryptedDEK is upsert semantics: first call
-// inserts; subsequent calls overwrite and bump the internal
-// dek_version (the version is not exposed on the port — rotation is
-// the only consumer that cares).
+// GetEncryptedDEK returns the tenant's wrapped DEK and its current
+// dek_version. ErrNotFound is returned for a tenant that has never
+// been provisioned.
+//
+// PutEncryptedDEK is load-or-store semantics for the provisioning
+// flow: if no row exists for userID, ciphertextDEK is stored at
+// version 1 and returned unchanged. If a row already exists, the
+// existing (canonicalDEK, version) is returned and the caller's
+// argument is discarded. This shape lets the loser of a concurrent
+// first-Create race for the same tenant reuse the winner's DEK
+// without an extra round-trip — credentials encrypted under the
+// losing local DEK would otherwise be undecryptable, since the
+// tenants row can only hold one wrapped DEK at a time.
+//
+// Rotation (a future PRD) gets its own explicit method; rotation
+// and provisioning are semantically distinct and do not share this
+// entry point.
 type TenantStore interface {
-	GetEncryptedDEK(ctx context.Context, userID string) (ciphertextDEK []byte, err error)
-	PutEncryptedDEK(ctx context.Context, userID string, ciphertextDEK []byte) error
+	GetEncryptedDEK(ctx context.Context, userID string) (ciphertextDEK []byte, version int, err error)
+	PutEncryptedDEK(ctx context.Context, userID string, ciphertextDEK []byte) (canonicalDEK []byte, version int, err error)
 }
 
 // Provider is the seam to an external storage-provider integration

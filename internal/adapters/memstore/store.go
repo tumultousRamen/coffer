@@ -96,7 +96,7 @@ func (s *Store) List(_ context.Context, userID string) ([]vault.CredentialSummar
 // duplicate ID.
 func (s *Store) Create(ctx context.Context, userID string, c vault.Credential) error {
 	if s.tenants != nil {
-		if _, err := s.tenants.GetEncryptedDEK(ctx, userID); err != nil {
+		if _, _, err := s.tenants.GetEncryptedDEK(ctx, userID); err != nil {
 			if err == vault.ErrNotFound {
 				return vault.ErrTenantNotProvisioned
 			}

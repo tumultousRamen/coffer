@@ -19,38 +19,67 @@ func NewTenantStore(db *sql.DB) *TenantStore {
 	return &TenantStore{db: db}
 }
 
-// GetEncryptedDEK fetches the wrapped DEK for userID. Returns
-// vault.ErrNotFound if no row exists.
-func (s *TenantStore) GetEncryptedDEK(ctx context.Context, userID string) ([]byte, error) {
-	var dek []byte
+// GetEncryptedDEK fetches the wrapped DEK and dek_version for userID.
+// Returns vault.ErrNotFound if no row exists.
+func (s *TenantStore) GetEncryptedDEK(ctx context.Context, userID string) ([]byte, int, error) {
+	var (
+		dek     []byte
+		version int
+	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT encrypted_dek FROM tenants WHERE user_id = $1`,
+		`SELECT encrypted_dek, dek_version FROM tenants WHERE user_id = $1`,
 		userID,
-	).Scan(&dek)
+	).Scan(&dek, &version)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, vault.ErrNotFound
+		return nil, 0, vault.ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("postgres: select tenant: %w", err)
+		return nil, 0, fmt.Errorf("postgres: select tenant: %w", err)
 	}
-	return dek, nil
+	return dek, version, nil
 }
 
-// PutEncryptedDEK upserts the wrapped DEK for userID. First call
-// inserts with dek_version = 1. Subsequent calls overwrite
-// encrypted_dek and monotonically bump dek_version (the future
-// rotation path; the port intentionally hides the counter).
-func (s *TenantStore) PutEncryptedDEK(ctx context.Context, userID string, ciphertextDEK []byte) error {
-	_, err := s.db.ExecContext(ctx, `
+// PutEncryptedDEK is load-or-store. INSERT ... ON CONFLICT DO NOTHING
+// gives us "first writer wins" atomicity at the database. On the
+// winning insert RETURNING surfaces the row we just wrote; on the
+// no-op path a follow-up SELECT fetches the canonical row that's
+// already there. Either way the caller learns whichever DEK actually
+// landed in the tenants row.
+//
+// Both branches return defensive copies; pgx allocates fresh slices on
+// every Scan, so the bytes we return are independent of any internal
+// driver state.
+func (s *TenantStore) PutEncryptedDEK(ctx context.Context, userID string, ciphertextDEK []byte) ([]byte, int, error) {
+	var (
+		canonical []byte
+		version   int
+	)
+	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO tenants (user_id, encrypted_dek, dek_version)
 		VALUES ($1, $2, 1)
-		ON CONFLICT (user_id) DO UPDATE
-		SET encrypted_dek = EXCLUDED.encrypted_dek,
-		    dek_version   = tenants.dek_version + 1,
-		    updated_at    = now()
-	`, userID, ciphertextDEK)
-	if err != nil {
-		return fmt.Errorf("postgres: upsert tenant: %w", mapInsertErr(err))
+		ON CONFLICT (user_id) DO NOTHING
+		RETURNING encrypted_dek, dek_version
+	`, userID, ciphertextDEK).Scan(&canonical, &version)
+
+	if err == nil {
+		return canonical, version, nil
 	}
-	return nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, 0, fmt.Errorf("postgres: upsert tenant: %w", mapInsertErr(err))
+	}
+
+	// No row from the INSERT path → conflict was a no-op. Read the
+	// canonical row that's already there.
+	err = s.db.QueryRowContext(ctx,
+		`SELECT encrypted_dek, dek_version FROM tenants WHERE user_id = $1`,
+		userID,
+	).Scan(&canonical, &version)
+	if err != nil {
+		// A row that conflicted moments ago should still be there. If
+		// it isn't, surface the raw error rather than ErrNotFound — the
+		// caller's load-or-store contract has been violated by an
+		// out-of-band actor.
+		return nil, 0, fmt.Errorf("postgres: select after upsert conflict: %w", err)
+	}
+	return canonical, version, nil
 }

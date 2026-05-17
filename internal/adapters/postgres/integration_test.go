@@ -143,10 +143,10 @@ func TestPostgres_BYTEAByteEqualRoundTrip(t *testing.T) {
 	for i := range want {
 		want[i] = byte(i * 31)
 	}
-	if err := ts.PutEncryptedDEK(ctx, userID, want); err != nil {
+	if _, _, err := ts.PutEncryptedDEK(ctx, userID, want); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	got, err := ts.GetEncryptedDEK(ctx, userID)
+	got, _, err := ts.GetEncryptedDEK(ctx, userID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestPostgres_JSONBRoundTripUnmarshalEqual(t *testing.T) {
 	cs := postgres.NewCredentialStore(db)
 
 	userID := uuid.NewString()
-	if err := ts.PutEncryptedDEK(ctx, userID, []byte("dek")); err != nil {
+	if _, _, err := ts.PutEncryptedDEK(ctx, userID, []byte("dek")); err != nil {
 		t.Fatalf("Put tenant: %v", err)
 	}
 
@@ -181,11 +181,13 @@ func TestPostgres_JSONBRoundTripUnmarshalEqual(t *testing.T) {
 		"absence": nil,
 	}
 	c := vault.Credential{
-		ID:       credID,
-		Provider: "s3",
-		Label:    "prod",
-		Secret:   vault.NewSecretBlob([]byte("ciphertext")),
-		Metadata: original,
+		ID:         credID,
+		Provider:   "s3",
+		Label:      "prod",
+		Secret:     vault.NewSecretBlob([]byte("ciphertext")),
+		Metadata:   original,
+		Nonce:      []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+		DEKVersion: 1,
 	}
 	if err := cs.Create(ctx, userID, c); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -215,11 +217,13 @@ func TestPostgres_FKViolationMapping(t *testing.T) {
 
 	cs := postgres.NewCredentialStore(db)
 	err := cs.Create(ctx, uuid.NewString(), vault.Credential{
-		ID:       uuid.NewString(),
-		Provider: "s3",
-		Label:    "p",
-		Secret:   vault.NewSecretBlob([]byte("x")),
-		Metadata: vault.Metadata{},
+		ID:         uuid.NewString(),
+		Provider:   "s3",
+		Label:      "p",
+		Secret:     vault.NewSecretBlob([]byte("x")),
+		Metadata:   vault.Metadata{},
+		Nonce:      []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+		DEKVersion: 1,
 	})
 	if !errors.Is(err, vault.ErrTenantNotProvisioned) {
 		t.Errorf("FK violation err = %v, want ErrTenantNotProvisioned", err)
@@ -236,15 +240,17 @@ func TestPostgres_UniqueViolationMapping(t *testing.T) {
 	cs := postgres.NewCredentialStore(db)
 
 	userID := uuid.NewString()
-	if err := ts.PutEncryptedDEK(ctx, userID, []byte("dek")); err != nil {
+	if _, _, err := ts.PutEncryptedDEK(ctx, userID, []byte("dek")); err != nil {
 		t.Fatalf("Put tenant: %v", err)
 	}
 	first := vault.Credential{
-		ID:       uuid.NewString(),
-		Provider: "s3",
-		Label:    "prod",
-		Secret:   vault.NewSecretBlob([]byte("x")),
-		Metadata: vault.Metadata{},
+		ID:         uuid.NewString(),
+		Provider:   "s3",
+		Label:      "prod",
+		Secret:     vault.NewSecretBlob([]byte("x")),
+		Metadata:   vault.Metadata{},
+		Nonce:      []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+		DEKVersion: 1,
 	}
 	if err := cs.Create(ctx, userID, first); err != nil {
 		t.Fatalf("first Create: %v", err)
@@ -268,7 +274,7 @@ func TestPostgres_ConcurrentCreateRace(t *testing.T) {
 	cs := postgres.NewCredentialStore(db)
 
 	userID := uuid.NewString()
-	if err := ts.PutEncryptedDEK(ctx, userID, []byte("dek")); err != nil {
+	if _, _, err := ts.PutEncryptedDEK(ctx, userID, []byte("dek")); err != nil {
 		t.Fatalf("Put tenant: %v", err)
 	}
 
@@ -280,11 +286,13 @@ func TestPostgres_ConcurrentCreateRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			results <- cs.Create(ctx, userID, vault.Credential{
-				ID:       uuid.NewString(),
-				Provider: "s3",
-				Label:    "contended",
-				Secret:   vault.NewSecretBlob([]byte("x")),
-				Metadata: vault.Metadata{},
+				ID:         uuid.NewString(),
+				Provider:   "s3",
+				Label:      "contended",
+				Secret:     vault.NewSecretBlob([]byte("x")),
+				Metadata:   vault.Metadata{},
+				Nonce:      []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+				DEKVersion: 1,
 			})
 		}()
 	}

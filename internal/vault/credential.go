@@ -16,16 +16,28 @@ const (
 // encrypted secret blob per the two-blob model (ADR 0005).
 type Metadata map[string]any
 
-// Credential is the full credential record including plaintext secret
-// material. Returned to workers from gRPC GetCredentials. Must never
-// be returned from a user-facing REST handler — use CredentialSummary
-// instead.
+// Credential is the full credential record. It leads a dual life:
+//
+//   - On the storage path (CredentialStore.Get/Create/Replace) Secret
+//     holds the AES-GCM ciphertext and Nonce / DEKVersion carry the
+//     row's per-secret nonce and the tenant DEK epoch under which the
+//     ciphertext was sealed. All three fields round-trip through the
+//     CredentialStore implementations.
+//   - On the worker-facing decrypt path (returned by the service-layer
+//     FetchForWorker method, a future PRD) Secret holds plaintext and
+//     Nonce / DEKVersion are left zero — they have served their purpose
+//     during decrypt and the worker has no use for them.
+//
+// Must never be returned from a user-facing REST handler — use
+// CredentialSummary instead.
 type Credential struct {
-	ID       string
-	Provider string
-	Label    string
-	Secret   SecretBlob
-	Metadata Metadata
+	ID         string
+	Provider   string
+	Label      string
+	Secret     SecretBlob
+	Metadata   Metadata
+	Nonce      []byte // populated on storage path; zero on worker-facing decrypt path
+	DEKVersion int    // populated on storage path; zero on worker-facing decrypt path
 }
 
 // CredentialSummary is the user-facing projection of a credential. It
