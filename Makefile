@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy test check-imports check
+.PHONY: smoke smoke-negative smoke-cleanup tidy test integration check-imports check
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -29,7 +29,14 @@ tidy:
 
 # Run all Go tests. No infra required.
 test:
-	go test ./...
+	go test -race ./...
+
+# Run integration tests against real AWS KMS. Requires AWS_PROFILE so SSO
+# credentials are picked up; skipped (loudly) without it so CI never
+# silently no-ops the integration coverage.
+integration:
+	@if [ -z "$$AWS_PROFILE" ]; then echo "SKIP: AWS_PROFILE unset"; exit 0; fi
+	go test -tags integration ./internal/adapters/awskms/...
 
 # Enforce hexagonal one-way imports (ADR 0010 §1):
 # internal/vault is the core and must not import from internal/adapters
