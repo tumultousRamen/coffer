@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy test integration check-imports check
+.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -31,12 +31,28 @@ tidy:
 test:
 	go test -race ./...
 
-# Run integration tests against real AWS KMS. Requires AWS_PROFILE so SSO
-# credentials are picked up; skipped (loudly) without it so CI never
-# silently no-ops the integration coverage.
+# Run integration tests against real infra. Each adapter is
+# self-gating:
+#   * awskms — t.Skip if AWS_PROFILE is unset
+#   * postgres — TestMain prints "DATABASE_URL not set; skipping" and
+#     exits 0 if DATABASE_URL is unset
+# So you can run a subset by exporting just one env var, or run both
+# with .env.local sourced below.
 integration:
-	@if [ -z "$$AWS_PROFILE" ]; then echo "SKIP: AWS_PROFILE unset"; exit 0; fi
-	go test -tags integration ./internal/adapters/awskms/...
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  go test -tags integration -race ./internal/adapters/awskms/... ./internal/adapters/postgres/...'
+
+# Apply embedded migrations (creates tenants + credentials tables).
+migrate-up:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  if [ -z "$$DATABASE_URL" ]; then echo "ENV: DATABASE_URL missing"; exit 1; fi; \
+	  go run ./cmd/migrate up'
+
+# Roll back the most recent migration.
+migrate-down:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  if [ -z "$$DATABASE_URL" ]; then echo "ENV: DATABASE_URL missing"; exit 1; fi; \
+	  go run ./cmd/migrate down'
 
 # Enforce hexagonal one-way imports (ADR 0010 §1):
 # internal/vault is the core and must not import from internal/adapters

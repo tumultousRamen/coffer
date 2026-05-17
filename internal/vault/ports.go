@@ -32,6 +32,19 @@ type CredentialStore interface {
 	Delete(ctx context.Context, userID, id string) error
 }
 
+// TenantStore is the seam to the per-tenant DEK wrapper store
+// (Postgres `tenants` table in production; memstore in tests).
+//
+// GetEncryptedDEK returns ErrNotFound for a tenant that has never
+// been provisioned. PutEncryptedDEK is upsert semantics: first call
+// inserts; subsequent calls overwrite and bump the internal
+// dek_version (the version is not exposed on the port — rotation is
+// the only consumer that cares).
+type TenantStore interface {
+	GetEncryptedDEK(ctx context.Context, userID string) (ciphertextDEK []byte, err error)
+	PutEncryptedDEK(ctx context.Context, userID string, ciphertextDEK []byte) error
+}
+
 // Provider is the seam to an external storage-provider integration
 // (S3, Dropbox, Google Drive, Box, …). Implementations live in
 // internal/adapters/providers/.
