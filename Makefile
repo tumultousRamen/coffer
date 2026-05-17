@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy test check-imports check
+.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -29,7 +29,27 @@ tidy:
 
 # Run all Go tests. No infra required.
 test:
-	go test ./...
+	go test -race ./...
+
+# Run integration tests that hit real Supabase. Requires DATABASE_URL.
+# Build tag `integration` keeps these out of the default `test` target.
+# Migrations are applied on startup by integration_test.go's TestMain.
+integration:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  if [ -z "$$DATABASE_URL" ]; then echo "ENV: DATABASE_URL missing -- copy .env.local.example to .env.local"; exit 1; fi; \
+	  go test -tags integration -race ./internal/adapters/postgres/...'
+
+# Apply embedded migrations (creates tenants + credentials tables).
+migrate-up:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  if [ -z "$$DATABASE_URL" ]; then echo "ENV: DATABASE_URL missing"; exit 1; fi; \
+	  go run ./cmd/migrate up'
+
+# Roll back the most recent migration.
+migrate-down:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  if [ -z "$$DATABASE_URL" ]; then echo "ENV: DATABASE_URL missing"; exit 1; fi; \
+	  go run ./cmd/migrate down'
 
 # Enforce hexagonal one-way imports (ADR 0010 §1):
 # internal/vault is the core and must not import from internal/adapters

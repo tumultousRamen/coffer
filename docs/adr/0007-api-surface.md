@@ -118,3 +118,7 @@ Redis is already in the stack per [ADR 0004](0004-dek-cache.md) (rate limiting, 
 - Streaming RPCs / server-push for credential changes (not needed; workers fetch once per job).
 - Versioned API surface (`/v2/`) — single version is fine for the trial; document the path.
 - Granular permissions ("read-only credential", "shared-with-team credential") — future product features, not vault concerns.
+
+## Update — PRD 0004 (2026-05-17)
+
+The "reject the whole request if any ID is unauthorized / missing" rule (§38 above) is **now enforced at the service layer**, not at the storage port. The `CredentialStore.Get` port contract returns whichever IDs exist and drops the rest — service-layer code is responsible for translating an incomplete result into the reject-whole API behavior described above. The contract is locked in by `portcontract.RunCredentialStoreContract`'s `GetMixedValidInvalidReturnsOnlyValid` scenario; the service-layer PRD must add the wrapper enforcement before any user-facing API ships.

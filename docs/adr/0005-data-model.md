@@ -65,6 +65,15 @@ CREATE INDEX        credentials_user_provider       ON credentials (user_id, pro
 - The AAD on `secret_ciphertext` is `user_id || credential_id || provider` (per ADR 0003) — `credential_id` is the row's `id`.
 - DEK rotation iterates `credentials WHERE user_id = $1 AND dek_version = $old`, re-encrypts, updates `dek_version`. Single transaction per tenant; ≤5 rows.
 
+## Update — PRD 0004 (2026-05-17)
+
+Two deferrals to flag for the service-layer PRD, both deliberate scope cuts in PRD 0004 (storage-only):
+
+- **`credentials.nonce` is written as empty bytes.** The schema column is `NOT NULL` and accepts a zero-length BYTEA, so the constraint holds. The current `vault.Credential` type has no `Nonce` field; the service-layer PRD reshapes the type and the call site simultaneously so storage round-trips both ciphertext and nonce as ADR 0003 requires.
+- **`credentials.dek_version` is hardcoded to 1 at insert time.** The live version lives on the `tenants` row; once the service layer plumbs the `tenants.dek_version` through `Cryptor.Encrypt`, the adapter writes the real value. Rotation logic (per "DEK rotation iterates ..." above) is not yet implemented and remains a future PRD.
+
+Also: `CredentialStore.Get` returns whichever requested IDs exist and silently drops the rest, with no order guarantee. Order-of-IDs and reject-whole-on-miss are now service-layer concerns — see ADR 0007's PRD-0004 update for the reasoning.
+
 ## On RLS specifically
 
 The default Supabase posture is RLS-on for every table. We deliberately disable it for `tenants` and `credentials`. The vault service connects to Postgres with a single dedicated role that has direct access. Authz is enforced **before** the query, against the per-job capability token (ADR 0002) — by the time a query is constructed, the user_id has already been authorized. RLS in this architecture would either be redundant (same check, twice) or actively wrong (would block legitimate cross-tenant work like the refresh queue).

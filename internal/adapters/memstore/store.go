@@ -1,8 +1,9 @@
 // Package memstore is an in-process implementation of
-// vault.CredentialStore backed by a sync.RWMutex-guarded map. It is the
-// reference adapter — every later CredentialStore implementation (the
-// Postgres adapter in PRD 0003 first) must produce behavior identical
-// to this one against the contract tests.
+// vault.CredentialStore and vault.TenantStore backed by sync.RWMutex-
+// guarded maps. It is the reference adapter — every later
+// implementation (the Postgres adapter from PRD 0004 onward) must
+// produce behavior identical to this one against the shared contract
+// tests in internal/vault/portcontract.
 package memstore
 
 import (
@@ -14,8 +15,6 @@ import (
 	"github.com/tumultousRamen/coffer/internal/vault"
 )
 
-// record bundles a stored Credential with the timestamps the
-// CredentialSummary projection needs but Credential does not carry.
 type record struct {
 	cred      vault.Credential
 	status    vault.Status
@@ -23,15 +22,16 @@ type record struct {
 }
 
 // Store is an in-memory CredentialStore. The zero value is not usable;
-// construct with New.
+// construct with New or NewWithTenants.
 type Store struct {
-	mu  sync.RWMutex
-	now func() time.Time
-	// data is keyed by userID, then credentialID.
-	data map[string]map[string]record
+	mu      sync.RWMutex
+	now     func() time.Time
+	tenants *TenantStore
+	data    map[string]map[string]record
 }
 
-// New returns an empty Store using time.Now for timestamps.
+// New returns an empty Store without tenant-FK enforcement. Suitable
+// for tests that exercise the CredentialStore in isolation.
 func New() *Store {
 	return &Store{
 		now:  time.Now,
@@ -39,34 +39,36 @@ func New() *Store {
 	}
 }
 
+// NewWithTenants returns a Store that enforces tenant existence on
+// Create — matching the Postgres adapter's FK behavior. Pass the same
+// *TenantStore that the surrounding system uses to provision tenants.
+func NewWithTenants(ts *TenantStore) *Store {
+	s := New()
+	s.tenants = ts
+	return s
+}
+
 // Get returns the credentials whose IDs are listed in ids, scoped to
-// userID. Any missing ID yields ErrNotFound — partial reads would leak
-// existence information across users (per ADR 0007 §1 authorization
-// reasoning). Order of the returned slice matches the order of ids.
+// userID. Missing IDs are silently dropped — the caller (service
+// layer) decides whether a partial result is acceptable. Matches the
+// `SELECT ... WHERE id = ANY($2)` semantics of the Postgres adapter.
 func (s *Store) Get(_ context.Context, userID string, ids []string) ([]vault.Credential, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	bucket, ok := s.data[userID]
-	if !ok {
-		return nil, vault.ErrNotFound
-	}
-
+	bucket := s.data[userID]
 	out := make([]vault.Credential, 0, len(ids))
 	for _, id := range ids {
-		rec, ok := bucket[id]
-		if !ok {
-			return nil, vault.ErrNotFound
+		if rec, ok := bucket[id]; ok {
+			out = append(out, rec.cred)
 		}
-		out = append(out, rec.cred)
 	}
 	return out, nil
 }
 
 // List returns CredentialSummary records for every credential owned by
 // userID. Results are sorted by ID for deterministic test output. An
-// unknown userID returns an empty slice (not an error) — listing is a
-// "show me what I have" operation and emptiness is a valid answer.
+// unknown userID returns an empty slice (not an error).
 func (s *Store) List(_ context.Context, userID string) ([]vault.CredentialSummary, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -86,9 +88,22 @@ func (s *Store) List(_ context.Context, userID string) ([]vault.CredentialSummar
 	return out, nil
 }
 
-// Create inserts c under userID. Returns ErrAlreadyExists if a record
-// with the same ID is already present for that user.
-func (s *Store) Create(_ context.Context, userID string, c vault.Credential) error {
+// Create inserts c under userID. When the Store was built with
+// NewWithTenants and the tenant has no DEK, returns
+// ErrTenantNotProvisioned (matches the FK constraint in the Postgres
+// adapter). Returns ErrAlreadyExists on duplicate (userID, provider,
+// label) — same unique constraint as the Postgres adapter — and on
+// duplicate ID.
+func (s *Store) Create(ctx context.Context, userID string, c vault.Credential) error {
+	if s.tenants != nil {
+		if _, err := s.tenants.GetEncryptedDEK(ctx, userID); err != nil {
+			if err == vault.ErrNotFound {
+				return vault.ErrTenantNotProvisioned
+			}
+			return err
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -100,6 +115,11 @@ func (s *Store) Create(_ context.Context, userID string, c vault.Credential) err
 	if _, exists := bucket[c.ID]; exists {
 		return vault.ErrAlreadyExists
 	}
+	for _, rec := range bucket {
+		if rec.cred.Provider == c.Provider && rec.cred.Label == c.Label {
+			return vault.ErrAlreadyExists
+		}
+	}
 	bucket[c.ID] = record{
 		cred:      c,
 		status:    vault.StatusActive,
@@ -109,9 +129,8 @@ func (s *Store) Create(_ context.Context, userID string, c vault.Credential) err
 }
 
 // Replace overwrites the credential at c.ID for userID. Returns
-// ErrNotFound if the target does not exist; createdAt is preserved
-// across replacements (matches the row-level semantics of ADR 0005:
-// id and created_at are stable, secret_ciphertext + metadata change).
+// ErrNotFound if the target does not exist; createdAt and status are
+// preserved across replacements (row-level semantics of ADR 0005).
 func (s *Store) Replace(_ context.Context, userID string, c vault.Credential) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
