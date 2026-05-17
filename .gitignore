@@ -1,6 +1,7 @@
 .agents/
 skills-lock.json
 scratch.md
+.checkpoint/
 
 # Go
 *.exe
