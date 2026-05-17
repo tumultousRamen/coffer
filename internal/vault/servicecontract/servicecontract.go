@@ -15,6 +15,7 @@
 package servicecontract
 
 import (
+	"crypto/ed25519"
 	"testing"
 
 	"github.com/tumultousRamen/coffer/internal/vault"
@@ -39,6 +40,12 @@ type Bundle struct {
 	Store   vault.CredentialStore
 	Cryptor *vault.Cryptor
 	KMS     *CountingKeyManager
+
+	// GrantSigner is the ed25519 private key paired with the
+	// GrantVerifier the Service was built with. Scenarios use it via
+	// vault.MintGrant to issue test grant tokens. Production never
+	// has this — the control plane is the only holder.
+	GrantSigner ed25519.PrivateKey
 }
 
 // Factory returns a fresh, isolated Bundle on each call. It is

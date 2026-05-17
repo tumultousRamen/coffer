@@ -1,0 +1,51 @@
+// Package coffer.v1 — the worker-facing read API for coffer.
+//
+// At trial scope the only RPC is GetCredentials. Transfer workers
+// present a signed per-job capability token (ed25519, see ADR 0002)
+// and a bounded list of credential IDs; the vault verifies the
+// token, decrypts each row, and returns plaintexts.
+//
+// Deviation from ADR 0007: the Credential.secret field is bytes
+// rather than google.protobuf.Struct. Trial scope has no providers
+// structuring the payload, so Struct would require a synthetic
+// wrapper. The wire shape becomes Struct (or a oneof per provider)
+// when provider adapters land. See docs/adr/0007-api-surface.md
+// "Update — PRD 0006" for the migration plan.
+syntax = "proto3";
+
+package coffer.v1;
+
+option go_package = "github.com/tumultousRamen/coffer/internal/transport/grpc/pb;pb";
+
+import "google/protobuf/struct.proto";
+
+service Vault {
+  // GetCredentials returns the decrypted plaintext for each requested
+  // credential ID, scoped to the user named in the grant token's sub
+  // claim. The whole request is rejected if any ID is unauthorized,
+  // missing, or out of bounds (ADR 0007 §38).
+  rpc GetCredentials(GetCredentialsRequest) returns (GetCredentialsResponse);
+}
+
+message GetCredentialsRequest {
+  // Signed per-job capability token (JWT, ed25519). Claims include
+  // sub (user_id), credential_ids, aud=coffer-vault, exp.
+  string grant_token = 1;
+  // Bounded set of credential IDs to fetch. The server rejects
+  // requests with more than 8 IDs (ADR 0007).
+  repeated string credential_ids = 2;
+}
+
+message GetCredentialsResponse {
+  repeated Credential credentials = 1;
+}
+
+message Credential {
+  string id = 1;
+  string provider = 2;
+  string label = 3;
+  // bytes for trial; will become Struct (or oneof per provider) when
+  // provider adapters land. See file header.
+  bytes secret = 4;
+  google.protobuf.Struct metadata = 5;
+}

@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check
+.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check proto run
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -55,16 +55,41 @@ migrate-down:
 	  go run ./cmd/migrate down'
 
 # Enforce hexagonal one-way imports (ADR 0010 §1):
-# internal/vault is the core and must not import from internal/adapters
-# or internal/transport. Fails non-zero on any match.
+# internal/vault must not import from internal/adapters or internal/transport.
+# internal/transport must not import from internal/adapters (composition root
+# in cmd/vault is the only place both layers may be wired together).
+# Fails non-zero on any match.
 check-imports:
-	@matches=$$(grep -rE 'github.com/tumultousRamen/coffer/internal/(adapters|transport)' internal/vault || true); \
-	if [ -n "$$matches" ]; then \
+	@vault_matches=$$(grep -rE 'github.com/tumultousRamen/coffer/internal/(adapters|transport)' internal/vault || true); \
+	if [ -n "$$vault_matches" ]; then \
 	  echo "FAIL: internal/vault imports forbidden package:"; \
-	  echo "$$matches"; \
+	  echo "$$vault_matches"; \
 	  exit 1; \
 	fi; \
-	echo "imports OK: internal/vault is clean"
+	transport_matches=$$(grep -rE 'github.com/tumultousRamen/coffer/internal/adapters' internal/transport || true); \
+	if [ -n "$$transport_matches" ]; then \
+	  echo "FAIL: internal/transport imports forbidden package:"; \
+	  echo "$$transport_matches"; \
+	  exit 1; \
+	fi; \
+	echo "imports OK: internal/vault + internal/transport are clean"
+
+# Regenerate the Go bindings from the protobuf source. Requires
+# `protoc` plus the protoc-gen-go / protoc-gen-go-grpc plugins on PATH.
+# CI does not regenerate; the committed .pb.go files are the artifact.
+proto:
+	@PATH="$$(go env GOPATH)/bin:$$PATH" protoc -I api --go_out=. --go-grpc_out=. api/coffer/v1/vault.proto
+	@rm -rf internal/transport/grpc/pb
+	@mkdir -p internal/transport/grpc/pb
+	@mv github.com/tumultousRamen/coffer/internal/transport/grpc/pb/* internal/transport/grpc/pb/
+	@rm -rf github.com
+	@echo "proto: regenerated internal/transport/grpc/pb/"
+
+# Boot the vault binary against .env.local. Expects all COFFER_*
+# env vars to be set (see cmd/vault/config.go for the full list).
+run:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  go run ./cmd/vault'
 
 # Aggregate gate run by the PR template.
 check: test check-imports
