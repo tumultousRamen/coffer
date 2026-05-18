@@ -27,13 +27,19 @@ Putting **plaintext** DEKs in Redis is unacceptable — a Redis compromise plus 
 
 ## Redis: what it actually does in this system
 
-Redis remains in the architecture, but **not as the DEK cache**. Its jobs are:
+Byteport's platform provides **two Redis instances per region**. coffer integrates with both:
 
-1. **Rate limiting** at the gateway (per user, per API key, per IP).
-2. **OAuth access-token cache** — short-lived access tokens minted from stored refresh tokens (see future ADR on provider abstraction).
-3. **Idempotency keys** on credential write paths (POST/PUT) to make retries safe.
+| Redis instance | Eviction policy | coffer's use |
+|---|---|---|
+| Hosted ElastiCache node | No-eviction (stateful) | Rate limiting (per user, per API key, per IP) **+** idempotency keys on POST/PUT |
+| Serverless ElastiCache | LRU only | **Not used by coffer.** Available; we have no current need. |
 
-These are use cases where Redis's strengths (shared state, fast TTL semantics, atomic ops) actually fit, without crossing the trust boundary into plaintext key material.
+**Why no OAuth access-token cache in Redis.** Earlier drafts of this ADR listed an OAuth access-token cache as a Redis use case. Dropped:
+- Access tokens already live encrypted in the `credentials.secret_ciphertext` row.
+- AES-GCM decrypt is microseconds; a Redis round-trip is ~1ms — caching encrypted tokens in Redis is a negative-latency win.
+- Caching **plaintext** access tokens in Redis re-introduces the trust-boundary problem we rejected for DEKs.
+
+Net result: Redis is used for **rate limiting and idempotency only**. Neither of those crosses the trust boundary into secret material.
 
 ## Consequences
 

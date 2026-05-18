@@ -1,15 +1,17 @@
 # ADR 0006 — Provider Adapter & OAuth Refresh Strategy
 
-S3 credentials are static; OAuth credentials (Dropbox, Google Drive, Box) expire and must be refreshed using a long-lived refresh token. The 200ms P99 read budget cannot absorb a synchronous call to a third-party OAuth endpoint (Dropbox/Google `/oauth/token` P99 is often >800ms). Refresh must therefore happen out-of-band so that `GetCredentials` is always a fast read of an already-fresh token.
+S3 credentials are static; OAuth credentials (Dropbox, Google Drive, Box) expire and must be refreshed using a long-lived refresh token. The 50ms read P99 SLO ([PRD §2](../PRD.md)) cannot routinely absorb a synchronous call to a third-party OAuth endpoint — Dropbox/Google `/oauth/token` P99 is often >800ms. The primary refresh path must therefore run out-of-band so that `GetCredentials` is, in the common case, a fast read of an already-fresh token.
 
 Refresh-policy options considered:
-- **Sync-on-read** — refresh inline on `GetCredentials` if the token is near expiry. Easiest to implement but blows the P99 budget.
+- **Sync-on-read** — refresh inline on `GetCredentials` if the token is near expiry. Easiest to implement but blows the P99 budget on every stale read.
 - **Scan-based async** — a background loop periodically scans for credentials expiring soon. Simple, no extra schema, but does polling work for negative results.
 - **Self-scheduling per-credential job (chosen)** — each successful refresh schedules its own successor at `new_access_token_expires_at − X`. No polling; each credential carries its own absolute next-fire timestamp.
 
+A **sync-on-stale fallback** sits on top of the chosen async model — see Decision §4 below.
+
 ## Decision
 
-**Self-scheduling, per-credential refresh jobs**, materialized in a `refresh_jobs` table. No sync fallback on the read path.
+**Self-scheduling, per-credential refresh jobs** as the primary path, materialized in a `refresh_jobs` table. A **sync-on-stale fallback** safety net handles the rare case where the refresh worker has fallen behind.
 
 ### Mechanics
 
@@ -24,7 +26,15 @@ Refresh-policy options considered:
    ```
    Each claimed job: load credential → call provider's token endpoint → re-encrypt with the tenant DEK → atomically update credential + reschedule the job to `new_expires_at - X`.
 3. **`run_at` is absolute, not relative.** If `X = 10 min` and the new token expires 60 min after refresh, the next job's `run_at` is `now() + 50 min`. Successor scheduling is always anchored to the provider's stated expiry, never to the previous job's fire time. This prevents drift if a refresh runs late.
-4. **No sync-on-read fallback.** If `GetCredentials` finds an expired access_token (background fell behind, refresh failed, token was revoked at the provider), the vault returns `FAILED_PRECONDITION` with a retry-after hint. The worker retries; the refresh job catches up. This is a deliberate choice — see Consequences.
+4. **Sync-on-stale fallback (safety net).** If `GetCredentials` finds an expired (or about-to-expire) access_token on the credential row, the vault:
+   1. Calls `/oauth/token` against the provider inline.
+   2. Re-encrypts the new token with the tenant DEK.
+   3. Atomically updates the credential row + reschedules `refresh_jobs.run_at = new_expires_at - X`.
+   4. Returns the fresh token to the worker.
+
+   If the inline refresh fails (transient provider error, network), the vault returns `FAILED_PRECONDITION` and the worker retries. If the inline refresh returns `invalid_grant` (refresh token revoked at provider), the vault marks `credentials.status = 'failed'`, deletes the `refresh_jobs` row, and returns `FAILED_PRECONDITION` — same terminal state the background refresh path produces.
+
+   **The sync-refresh path is allowed to live outside the 50ms read P99 SLO** — Dropbox/Google `/oauth/token` is ~200–800ms. This is acceptable because the path only fires when the refresh worker has fallen behind (rare, alerted), so it stays in P99.9+ territory and doesn't dominate P99. **The SLO is therefore load-bearing-dependent on refresh-worker health** — see [ADR 0008 §4](0008-failure-modes.md).
 
 ### Schema
 
@@ -84,7 +94,7 @@ S3 implements `NeedsScheduledRefresh() bool { return false }` and writing an S3 
 ## Consequences
 
 **Accepted trade-offs:**
-- **No sync fallback on the read path.** If the background refresher falls behind or a token is revoked between scheduled runs, `GetCredentials` returns an error and the worker retries. This was a deliberate choice over a hybrid sync+async model: sync-on-read couples the read-path P99 to the OAuth provider's P99 and is the single biggest threat to the 200ms KPI. The cost is operational — the refresh worker must stay healthy, and observability on `refresh_jobs.run_at < now() - margin` is a first-class alert.
+- **Hybrid async-first + sync-on-stale fallback.** Background refresh is the primary path. The sync fallback is the safety net for "refresh worker fell behind." Sync-refresh blows the 50ms read SLO on the path it fires (Dropbox/Google `/oauth/token` is ~500ms), but it should fire on <1% of reads and therefore lives in P99.9 territory, not P99. **The 50ms read P99 SLO is conditional on refresh-worker health being high enough that sync-refresh remains rare.** Operationally: `coffer_refresh_lag_seconds` is the SLO-load-bearing alert.
 - **Postgres is the job queue.** No Redis-Streams / SQS / Kafka. Justified by scale (≤3M OAuth credentials, ~830 refreshes/sec average even if all tokens were 1-hour) and by `FOR UPDATE SKIP LOCKED` providing safe concurrent job claiming. Scaling to 10M+ users would justify revisiting — sharding the scan by `user_id` hash is the natural next step. Noted, not built.
 - **Leader-elected single worker pool (Postgres advisory lock).** Avoids double-running across rolling deploys. Trivial to implement; trivial to remove if we want to shard later.
 

@@ -20,6 +20,8 @@ Options considered:
 
 The control-plane minting service is **out of scope** for this trial — the minimal API gateway will mint a permissive grant for demo purposes. The vault verifies grants regardless of who issued them; production swap-in is just a public-key rotation.
 
+**Concurrent jobs per worker.** A transfer worker may execute several jobs concurrently — Byteport's existing model has multiple in-flight jobs per worker process. Each job presents its own capability token on every `GetCredentials` call; tokens are not pooled, shared, or cached across jobs. The vault treats every request independently against the presented token, so concurrent jobs on the same worker get strict per-job isolation from each other.
+
 ## Consequences
 
 - **Blast radius of a compromised worker:** bounded to the credentials for the one in-flight job, not the whole vault and not even all of one user's credentials.

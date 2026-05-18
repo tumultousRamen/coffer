@@ -16,17 +16,18 @@ A Go/gRPC service that stores customer credentials for external storage provider
 ```mermaid
 flowchart LR
     User([User])
-    Worker([Transfer Worker])
+    Worker([Transfer Worker<br/>in region X])
     CP([Control Plane<br/>capability-token minter<br/><i>out of scope</i>])
 
-    subgraph coffer["coffer (this repo)"]
+    subgraph region["Region X (one of N)"]
         Gateway["cmd/gateway<br/>JWT • rate-limit • idempotency"]
-        Vault["cmd/vault<br/>gRPC + REST<br/><i>refresh worker (in-process)</i>"]
+        Vault["cmd/vault<br/>gRPC + REST<br/><i>refresh worker (in-process, leader-elected globally)</i>"]
+        Replica[("Aurora<br/>regional read replica")]
+        Redis[("Redis ×2<br/>no-evict + LRU<br/>ElastiCache")]
     end
 
-    PG[("Postgres<br/>Supabase")]
+    Primary[("Aurora primary<br/><i>writes</i>")]
     KMS[("AWS KMS")]
-    Redis[("Redis")]
     OAuthP([OAuth Providers<br/>Dropbox / GDrive / Box])
 
     User -->|HTTPS + JWT| Gateway
@@ -35,13 +36,17 @@ flowchart LR
     CP -.->|signs job grants| Worker
     Worker -->|gRPC + capability token| Vault
 
-    Vault --> PG
+    Vault -->|reads| Replica
+    Vault -.->|writes + miss-fallback| Primary
     Vault --> KMS
     Vault --> Redis
     Vault -.->|refresh worker| OAuthP
+    Primary ===>|async replication ~1s P99| Replica
 ```
 
-Two clients of the vault: **users** (manage credentials via REST through the gateway), **workers** (fetch credentials at transfer time via gRPC, direct). The control plane mints per-job capability tokens that scope what a worker can fetch. The refresh worker runs as a leader-elected goroutine pool **inside the vault binary** — not a separate process. See [ADR 0001](docs/adr/0001-secret-store-vs-broker.md), [ADR 0002](docs/adr/0002-worker-auth-capability-token.md), [ADR 0006](docs/adr/0006-provider-adapter-and-refresh.md).
+**Per-region deployment** ([ADR 0012](docs/adr/0012-multi-region-topology.md)). Each region runs its own vault + gateway + Aurora read replica + 2× Redis. Reads target the local replica; on miss, fall back to the global Aurora primary. Writes always go to the primary. The refresh worker is globally leader-elected (one across all regions) via Postgres advisory lock against the primary.
+
+Two clients: **users** (manage credentials via REST through the gateway), **workers** (fetch credentials at transfer time via gRPC, direct). The control plane mints per-job capability tokens that scope what a worker can fetch. See [ADR 0001](docs/adr/0001-secret-store-vs-broker.md), [ADR 0002](docs/adr/0002-worker-auth-capability-token.md), [ADR 0006](docs/adr/0006-provider-adapter-and-refresh.md), [ADR 0012](docs/adr/0012-multi-region-topology.md).
 
 ---
 
@@ -54,12 +59,20 @@ sequenceDiagram
     participant V as Vault
     participant C as DEK Cache<br/>(in-process LRU)
     participant K as AWS KMS
-    participant DB as Postgres
+    participant R as Regional Replica
+    participant P as Aurora Primary
 
     W->>V: GetCredentials(grant_token, [src_id, dst_id])
     V->>V: Verify grant signature + claims + exp
-    V->>DB: SELECT credentials WHERE id IN (...)
-    DB-->>V: rows (ciphertext, nonce, dek_version, metadata)
+    V->>R: SELECT credentials WHERE id IN (...)
+    R-->>V: rows (ciphertext, nonce, dek_version, metadata)
+
+    alt all rows returned
+        Note over V: continue
+    else some IDs missing (replication lag or genuine 404)
+        V->>P: SELECT missing IDs<br/>(primary-fallback-on-miss)
+        P-->>V: rows or empty
+    end
 
     V->>C: Lookup DEK for user_id
     alt cache hit
@@ -74,7 +87,7 @@ sequenceDiagram
     V-->>W: [Credential{secret, metadata}, ...]
 ```
 
-Steady-state hot path = 1 SELECT + 1 in-process AES-GCM. No KMS calls except on cold tenant. P99 budget 200 ms. See [ADR 0003](docs/adr/0003-envelope-encryption-shape.md), [ADR 0004](docs/adr/0004-dek-cache.md), [ADR 0007](docs/adr/0007-api-surface.md).
+Steady-state hot path = 1 SELECT against regional replica + 1 in-process AES-GCM. KMS only on cold tenant. Primary fallback only on miss (rare). **P99 budget 50ms end-to-end** ([ADR 0008](docs/adr/0008-failure-modes.md), [ADR 0012](docs/adr/0012-multi-region-topology.md)). See [ADR 0003](docs/adr/0003-envelope-encryption-shape.md), [ADR 0004](docs/adr/0004-dek-cache.md), [ADR 0007](docs/adr/0007-api-surface.md).
 
 ---
 
@@ -96,6 +109,8 @@ sequenceDiagram
     V->>DB: INSERT refresh_jobs(run_at = expires_at - X)
     V-->>U: 201 Created
 
+    rect rgba(200, 230, 255, 0.4)
+    Note over R,P: Primary path — background refresh (T-X before expiry)
     loop refresh tick
         R->>DB: SELECT FOR UPDATE SKIP LOCKED<br/>WHERE run_at <= now()
         DB-->>R: claim job
@@ -113,7 +128,24 @@ sequenceDiagram
             R->>DB: UPDATE credentials status='failed'<br/>DELETE refresh_jobs row
         end
     end
+    end
+
+    rect rgba(255, 230, 200, 0.5)
+    Note over V,P: Safety-net path — sync-on-stale fallback (rare)
+    V->>V: GetCredentials sees expired access_token<br/>on credential row
+    V->>P: POST /oauth/token (refresh_token) — inline
+    alt 200 OK
+        P-->>V: new access_token
+        V->>DB: BEGIN<br/>UPDATE credentials (re-encrypt)<br/>UPDATE refresh_jobs (run_at = new_expires - X)<br/>COMMIT
+        V-->>V: return fresh token to worker<br/>(blows 50ms SLO; lives in P99.9+)
+    else 4xx invalid_grant
+        V->>DB: UPDATE credentials status='failed'<br/>DELETE refresh_jobs row
+        V-->>V: return FAILED_PRECONDITION
+    end
+    end
 ```
+
+**Two paths.** The background refresh is the primary path — runs ahead of expiry, never blocks a worker, irrelevant to read SLO. The sync-on-stale fallback fires only when the refresh worker has fallen behind; it blows the 50ms read SLO on the path it triggers (Dropbox/Google `/oauth/token` is ~500ms) but should fire on <1% of reads, so the system-wide P99 holds. **Refresh-worker health is the load-bearing thing for the SLO** — `coffer_refresh_lag_seconds` is a first-class alert.
 
 `run_at` is absolute (`new_expires_at - X`), not relative — prevents drift if a refresh runs late. Rotated refresh tokens are persisted in the same transaction as the new access token (load-bearing correctness invariant). `status='failed'` is the dead-letter state; no separate DLQ. See [ADR 0006](docs/adr/0006-provider-adapter-and-refresh.md).
 
@@ -181,10 +213,10 @@ Byteport can swap any adapter — KMS, DB, provider, telemetry — by replacing 
 |---|---|
 | Language | Go |
 | Service interface | gRPC (worker-facing) + REST gateway (user-facing) |
-| Datastore | Postgres (Supabase-compatible) |
+| Datastore | **AWS Aurora Postgres** — single primary + per-region read replicas ([ADR 0012](docs/adr/0012-multi-region-topology.md)) |
 | Migrations | `golang-migrate` with embedded SQL files |
 | Key management | AWS KMS (envelope encryption, per-tenant DEK, AES-256-GCM) |
-| Cache / supporting | Redis (rate limiting, OAuth access-token cache, idempotency keys) |
+| Cache / supporting | Redis (rate limiting + idempotency keys only — no DEK cache, no OAuth-token cache) |
 | Observability | OpenTelemetry → Grafana |
 
 ---

@@ -47,7 +47,7 @@ CREATE INDEX        credentials_user_provider       ON credentials (user_id, pro
 | Tenancy | `user_id` only | Brief specifies "1M users, 5 creds per user". `org_id` is purely additive later — no preemptive column. |
 | Row-Level Security (RLS) | **Not used** | The vault service is the sole DB consumer; authz lives at the service layer against the capability token. RLS would add `SET LOCAL` overhead on every query, complicate connection pooling, and provide redundant defense at material complexity cost. |
 | Delete semantics | **Hard delete** on user-initiated DELETE | A user revoking a credential expects the ciphertext gone. Crypto-shred at the tenant level is handled by DEK retirement (ADR 0003). |
-| Migration tool | `golang-migrate/migrate` | Plain SQL `.up.sql` / `.down.sql` files under `internal/adapters/postgres/migrations/`. Embedded into the binary via `//go:embed` and run on boot. No ORM. Compatible with Supabase out of the box. |
+| Migration tool | `golang-migrate/migrate` | Plain SQL `.up.sql` / `.down.sql` files under `internal/adapters/postgres/migrations/`. Embedded into the binary via `//go:embed` and run on boot. No ORM. Compatible with Aurora Postgres out of the box. |
 
 ## Consequences
 
@@ -87,4 +87,4 @@ The Postgres implementation uses `INSERT … ON CONFLICT (user_id) DO NOTHING RE
 
 ## On RLS specifically
 
-The default Supabase posture is RLS-on for every table. We deliberately disable it for `tenants` and `credentials`. The vault service connects to Postgres with a single dedicated role that has direct access. Authz is enforced **before** the query, against the per-job capability token (ADR 0002) — by the time a query is constructed, the user_id has already been authorized. RLS in this architecture would either be redundant (same check, twice) or actively wrong (would block legitimate cross-tenant work like the refresh queue).
+The default Aurora Postgres posture is RLS-on for every table. We deliberately disable it for `tenants` and `credentials`. The vault service connects to Postgres with a single dedicated role that has direct access. Authz is enforced **before** the query, against the per-job capability token (ADR 0002) — by the time a query is constructed, the user_id has already been authorized. RLS in this architecture would either be redundant (same check, twice) or actively wrong (would block legitimate cross-tenant work like the refresh queue).

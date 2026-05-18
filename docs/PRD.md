@@ -17,8 +17,13 @@ The vault service is the system of record for those credentials. It must:
 | Users | 1M |
 | Credentials per user | 5 |
 | Total credentials | ~5M |
-| `GetCredentials` P99 latency (worker → vault) | 200ms |
+| `GetCredentials` P99 latency (worker → vault, end-to-end) | **50ms** |
+| Credential write P99 latency (POST/PUT) | **200ms** |
 | Availability | High — vault down = transfers down |
+
+The 50ms read P99 is **end-to-end and system-wide**, not just hot-path. It is **conditional on refresh-worker health**: the sync-on-stale OAuth refresh path ([ADR 0006](adr/0006-provider-adapter-and-refresh.md)) can take ~500ms, but is expected to fire on <1% of reads, so lives in P99.9+ territory. If refresh-lag rises and sync-refresh becomes common, P99 degrades — `coffer_refresh_lag_seconds` is therefore an SLO-load-bearing alert ([ADR 0009](adr/0009-observability.md)).
+
+The 50ms SLO assumes the vault is deployed regionally per [ADR 0012](adr/0012-multi-region-topology.md). Cross-region requests cannot meet this SLO.
 
 ## 3. Functional Requirements
 
@@ -44,7 +49,7 @@ System must:
 
 - **Language:** Go
 - **Service interface:** gRPC (worker-facing) + minimal REST gateway (user-facing)
-- **Datastore:** Postgres (Supabase-compatible for dev; portable to bare Postgres for prod)
+- **Datastore:** Aurora Postgres (primary + per-region read replicas; see [ADR 0012](adr/0012-multi-region-topology.md))
 - **Key management:** AWS KMS
 - **Supporting (optional):** Redis cache, refresh queue
 - **Observability:** OpenTelemetry → Grafana
@@ -67,12 +72,13 @@ See [docs/adr/](adr/). Each load-bearing decision is captured as a numbered ADR.
 | [0003](adr/0003-envelope-encryption-shape.md) | Per-tenant DEK, AES-256-GCM, KEK in AWS KMS, AAD bound to row identity | Security |
 | [0004](adr/0004-dek-cache.md) | In-process LRU only, 5-min TTL, single-flight on miss; no Redis for DEKs | Latency, Security |
 | [0005](adr/0005-data-model.md) | Two-blob schema (secret_ciphertext + metadata JSONB); UUIDv7; no RLS; hard delete | Replaceability |
-| [0006](adr/0006-provider-adapter-and-refresh.md) | Self-scheduling per-credential refresh jobs; no sync fallback; refresh-token rotation is a load-bearing invariant | Latency, Availability |
+| [0006](adr/0006-provider-adapter-and-refresh.md) | Self-scheduling per-credential refresh jobs; **sync-on-stale fallback** for safety net; refresh-token rotation is a load-bearing invariant | Latency, Availability |
 | [0007](adr/0007-api-surface.md) | gRPC batch fetch by `credential_ids`; REST gateway with JWT + idempotency; compile-time secret read-back guard | Security |
-| [0008](adr/0008-failure-modes.md) | KMS circuit breaker + extended cache TTL; single-primary Postgres; defined worker retry contract; split `/healthz` and `/readyz` | Availability |
+| [0008](adr/0008-failure-modes.md) | KMS circuit breaker + extended cache TTL; **Aurora primary + regional replicas with primary-fallback-on-miss**; regional replica outage = fail-and-alert; defined worker retry contract; split `/healthz` and `/readyz` | Availability |
 | [0009](adr/0009-observability.md) | Unified telemetry facade; OTel metrics + tracing; structured stdout audit log; type-level secret redaction | Replaceability |
 | [0010](adr/0010-modular-boundaries.md) | Hexagonal layout (`internal/vault` core, `internal/adapters/*`, `internal/transport/*`); env-var config; `coffer-migrate` CLI | Replaceability |
 | [0011](adr/0011-scope-and-build-order.md) | Work-trial plan: day-by-day order, strict-TDD scope, built-vs-stubbed-vs-cut surface, demo script | — |
+| [0012](adr/0012-multi-region-topology.md) | Vault deploys per region; Aurora primary + regional read replicas; read-after-write resolved via primary-fallback-on-miss; single-region KMS for trial, multi-region key for production | Latency, Availability |
 
 ## 8. Production Evolution
 

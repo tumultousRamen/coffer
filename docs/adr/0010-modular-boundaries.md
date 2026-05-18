@@ -3,7 +3,7 @@
 The brief's loudest signal is that Byteport must be able to extract this service and integrate it into their production system with minimal coupling. "Modular and replaceable" needs concrete boundaries — not a slogan. Three things have to be true:
 
 1. The **code** is structured so that infrastructure dependencies (KMS, DB, providers, telemetry) are behind small interfaces that Byteport can re-implement.
-2. The **config** is swappable without code changes — credentials and endpoints move from "Divya's AWS account" to "Byteport's AWS account" by changing env vars.
+2. The **config** is swappable without code changes — AWS accounts, KMS key IDs, DB URLs, and other endpoints all move between deployments by changing environment variables.
 3. The **data** is portable — there is a documented, demonstrated path to move tenant rows + DEKs from this Postgres + KMS to Byteport's Postgres + KMS.
 
 ## Decisions

@@ -15,3 +15,4 @@ Each load-bearing design choice gets a numbered ADR. Format: context → options
 | [0009](0009-observability.md) | Observability (unified telemetry facade, OTel, audit log, type-level secret redaction) | Accepted |
 | [0010](0010-modular-boundaries.md) | Modular & Replaceable Boundaries (hexagonal layout, env config, coffer-migrate CLI) | Accepted |
 | [0011](0011-scope-and-build-order.md) | Scope & Build Order (work-trial plan, day-by-day, TDD discipline, demo script) | Accepted |
+| [0012](0012-multi-region-topology.md) | Multi-Region Deployment Topology (Aurora primary + regional replicas, primary-fallback-on-miss) | Accepted |
