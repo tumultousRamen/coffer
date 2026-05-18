@@ -34,7 +34,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -178,6 +177,14 @@ func regionFromMetadata(metadata vault.Metadata) (string, error) {
 // long-lived AWS identity to manage for the probe. sessionToken is
 // empty for long-lived IAM keys; non-empty when the caller passed an
 // STS-derived triple (used by the integration test against SSO).
+//
+// config.WithCredentialsProvider is authoritative: the SDK wraps the
+// supplied provider with its own NewCredentialsCache and the resulting
+// resolution chain does NOT fall back to the ambient profile /
+// instance role even if the static credentials later fail. No extra
+// belt-and-braces override is required (an explicit reassignment of
+// cfg.Credentials confuses the middleware stack initialization on
+// modern SDK versions — see PRD 0008 commit history).
 func defaultClientFactory(ctx context.Context, key, secret, sessionToken, region string) (listBucketsAPI, error) {
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(region),
@@ -186,11 +193,6 @@ func defaultClientFactory(ctx context.Context, key, secret, sessionToken, region
 	if err != nil {
 		return nil, err
 	}
-	// Defense in depth: ensure the SDK does not silently fall back to
-	// an ambient profile / instance role if static creds somehow fail
-	// to load. The static provider above is required; this line
-	// disables any environment-derived credential fallback.
-	cfg.Credentials = aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(key, secret, sessionToken))
 	return awss3.NewFromConfig(cfg), nil
 }
 
