@@ -3,14 +3,29 @@ package servicecontract
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/tumultousRamen/coffer/internal/vault"
 )
+
+// mustGenKeyPair returns a fresh ed25519 keypair for tests that need
+// to mint tokens under a key the bundle's verifier does NOT trust
+// (e.g. the bad-signature scenario).
+func mustGenKeyPair(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey: %v", err)
+	}
+	return pub, priv
+}
 
 // RunServiceContract drives the full vault.Service behavior contract
 // against the bundle returned by factory. Every scenario builds a
@@ -34,6 +49,13 @@ func RunServiceContract(t *testing.T, factory Factory) {
 		{"SecondCredentialReusesDEK", testSecondCredentialReusesDEK},
 		{"CrossTenantIsolation", testCrossTenantIsolation},
 		{"ConcurrentFirstCreateAllDecryptable", testConcurrentFirstCreateAllDecryptable},
+		{"FetchForWorkerRoundTrip", testFetchForWorkerRoundTrip},
+		{"FetchForWorkerExpiredGrant", testFetchForWorkerExpiredGrant},
+		{"FetchForWorkerBadSignature", testFetchForWorkerBadSignature},
+		{"FetchForWorkerOutOfScopeID", testFetchForWorkerOutOfScopeID},
+		{"FetchForWorkerRejectWholeOnMissing", testFetchForWorkerRejectWholeOnMissing},
+		{"FetchForWorkerUnprovisionedTenant", testFetchForWorkerUnprovisionedTenant},
+		{"FetchForWorkerBatchReturnsAllPlaintexts", testFetchForWorkerBatchReturnsAllPlaintexts},
 	}
 
 	for _, tc := range tests {
@@ -433,3 +455,153 @@ func testConcurrentFirstCreateAllDecryptable(t *testing.T, b Bundle) {
 	}
 }
 
+
+// mintFor issues a grant token for userID authorizing exactly ids.
+// Default TTL 5 minutes — well inside the verifier's leeway.
+func mintFor(t *testing.T, b Bundle, userID string, ids []string) string {
+	t.Helper()
+	token, err := vault.MintGrant(b.GrantSigner, userID, ids, 5*time.Minute, "test-job")
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+	return token
+}
+
+func testFetchForWorkerRoundTrip(t *testing.T, b Bundle) {
+	ctx := context.Background()
+	userID := uuid.NewString()
+	plaintext := []byte("aws-secret-access-key-stuff")
+
+	id := mustCreate(t, b, userID, "s3", "prod_bucket", plaintext)
+	token := mintFor(t, b, userID, []string{id})
+
+	got, err := b.Service.FetchForWorker(ctx, token, []string{id})
+	if err != nil {
+		t.Fatalf("FetchForWorker: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("FetchForWorker returned %d credentials, want 1", len(got))
+	}
+	if got[0].ID != id {
+		t.Errorf("returned ID = %q, want %q", got[0].ID, id)
+	}
+	if got[0].Provider != "s3" || got[0].Label != "prod_bucket" {
+		t.Errorf("(provider,label) = (%q,%q), want (s3,prod_bucket)", got[0].Provider, got[0].Label)
+	}
+	if !bytes.Equal(got[0].Secret.Reveal(), plaintext) {
+		t.Errorf("returned plaintext = %q, want %q", got[0].Secret.Reveal(), plaintext)
+	}
+	// Worker-path Credentials must zero the storage-shape fields.
+	if got[0].Nonce != nil {
+		t.Errorf("Nonce should be zero on worker path, got %x", got[0].Nonce)
+	}
+	if got[0].DEKVersion != 0 {
+		t.Errorf("DEKVersion should be zero on worker path, got %d", got[0].DEKVersion)
+	}
+}
+
+func testFetchForWorkerExpiredGrant(t *testing.T, b Bundle) {
+	ctx := context.Background()
+	userID := uuid.NewString()
+	id := mustCreate(t, b, userID, "s3", "p", []byte("x"))
+
+	token, err := vault.MintGrant(b.GrantSigner, userID, []string{id}, -10*time.Minute, "j")
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+	_, err = b.Service.FetchForWorker(ctx, token, []string{id})
+	if !errors.Is(err, vault.ErrGrantExpired) {
+		t.Errorf("FetchForWorker expired grant err = %v, want ErrGrantExpired", err)
+	}
+}
+
+func testFetchForWorkerBadSignature(t *testing.T, b Bundle) {
+	ctx := context.Background()
+	userID := uuid.NewString()
+	id := mustCreate(t, b, userID, "s3", "p", []byte("x"))
+
+	// Mint with an unrelated private key — verifier built with b.GrantSigner's
+	// counterpart public key will reject.
+	_, otherPriv := mustGenKeyPair(t)
+	token, err := vault.MintGrant(otherPriv, userID, []string{id}, 5*time.Minute, "j")
+	if err != nil {
+		t.Fatalf("MintGrant: %v", err)
+	}
+	_, err = b.Service.FetchForWorker(ctx, token, []string{id})
+	if !errors.Is(err, vault.ErrGrantSignature) {
+		t.Errorf("FetchForWorker bad signature err = %v, want ErrGrantSignature", err)
+	}
+}
+
+func testFetchForWorkerOutOfScopeID(t *testing.T, b Bundle) {
+	ctx := context.Background()
+	userID := uuid.NewString()
+	idAuthorized := mustCreate(t, b, userID, "s3", "auth", []byte("a"))
+	idOther := mustCreate(t, b, userID, "s3", "other", []byte("b"))
+
+	// Token authorizes only idAuthorized; request asks for both.
+	token := mintFor(t, b, userID, []string{idAuthorized})
+	_, err := b.Service.FetchForWorker(ctx, token, []string{idAuthorized, idOther})
+	if !errors.Is(err, vault.ErrUnauthorized) {
+		t.Errorf("FetchForWorker out-of-scope err = %v, want ErrUnauthorized", err)
+	}
+}
+
+func testFetchForWorkerRejectWholeOnMissing(t *testing.T, b Bundle) {
+	ctx := context.Background()
+	userID := uuid.NewString()
+	existing := mustCreate(t, b, userID, "s3", "p", []byte("x"))
+	missing := uuid.NewString()
+
+	// Grant authorizes both IDs, but only one exists in storage.
+	token := mintFor(t, b, userID, []string{existing, missing})
+	_, err := b.Service.FetchForWorker(ctx, token, []string{existing, missing})
+	if !errors.Is(err, vault.ErrNotFound) {
+		t.Errorf("FetchForWorker partial-missing err = %v, want ErrNotFound (reject-whole)", err)
+	}
+}
+
+func testFetchForWorkerUnprovisionedTenant(t *testing.T, b Bundle) {
+	ctx := context.Background()
+	// userID is fresh and has no credentials/tenants row at all.
+	userID := uuid.NewString()
+	fakeID := uuid.NewString()
+	token := mintFor(t, b, userID, []string{fakeID})
+
+	_, err := b.Service.FetchForWorker(ctx, token, []string{fakeID})
+	if !errors.Is(err, vault.ErrTenantNotProvisioned) {
+		t.Errorf("FetchForWorker unprovisioned err = %v, want ErrTenantNotProvisioned", err)
+	}
+}
+
+func testFetchForWorkerBatchReturnsAllPlaintexts(t *testing.T, b Bundle) {
+	ctx := context.Background()
+	userID := uuid.NewString()
+	want := map[string][]byte{}
+	ids := make([]string, 0, 3)
+	for i, label := range []string{"a", "b", "c"} {
+		secret := []byte(fmt.Sprintf("secret-%d", i))
+		id := mustCreate(t, b, userID, "s3", label, secret)
+		want[id] = secret
+		ids = append(ids, id)
+	}
+	token := mintFor(t, b, userID, ids)
+
+	got, err := b.Service.FetchForWorker(ctx, token, ids)
+	if err != nil {
+		t.Fatalf("FetchForWorker batch: %v", err)
+	}
+	if len(got) != len(ids) {
+		t.Fatalf("FetchForWorker returned %d, want %d", len(got), len(ids))
+	}
+	for _, c := range got {
+		expected, ok := want[c.ID]
+		if !ok {
+			t.Errorf("FetchForWorker returned unexpected id %q", c.ID)
+			continue
+		}
+		if !bytes.Equal(c.Secret.Reveal(), expected) {
+			t.Errorf("id=%s plaintext = %q, want %q", c.ID, c.Secret.Reveal(), expected)
+		}
+	}
+}

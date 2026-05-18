@@ -19,18 +19,27 @@ import (
 
 // Service holds the wiring needed to drive credential lifecycle. The
 // zero value is not usable; construct with NewService.
+//
+// The verifier field is only consumed by FetchForWorker; REST-side
+// methods (Create/List/GetSummary/Replace/Delete) do not use it and
+// callers that only exercise the REST path may pass nil.
 type Service struct {
-	store   CredentialStore
-	tenants TenantStore
-	cryptor *Cryptor
+	store    CredentialStore
+	tenants  TenantStore
+	cryptor  *Cryptor
+	verifier *GrantVerifier
 }
 
-// NewService composes the three collaborators into a Service. All
-// three are required; nil checks are not performed (a misconfigured
-// service is a startup-time programmer error, not a runtime failure
-// mode).
-func NewService(store CredentialStore, tenants TenantStore, cryptor *Cryptor) *Service {
-	return &Service{store: store, tenants: tenants, cryptor: cryptor}
+// NewService composes the four collaborators into a Service.
+//
+// store, tenants, and cryptor are always required. verifier is
+// required only if the caller intends to invoke FetchForWorker; the
+// REST-side methods do not consult it. A nil verifier passed to a
+// service that later receives a FetchForWorker call surfaces as a
+// runtime panic — a misconfigured service is a startup-time
+// programmer error, not a request-time failure mode.
+func NewService(store CredentialStore, tenants TenantStore, cryptor *Cryptor, verifier *GrantVerifier) *Service {
+	return &Service{store: store, tenants: tenants, cryptor: cryptor, verifier: verifier}
 }
 
 // CreateCredential orchestrates the full create flow: provision the
@@ -175,6 +184,98 @@ func (s *Service) ReplaceCredential(
 // one.
 func (s *Service) DeleteCredential(ctx context.Context, userID, id string) error {
 	return s.store.Delete(ctx, userID, id)
+}
+
+// FetchForWorker is the worker-facing read path: verify the grant
+// token, confirm every requested credential ID is in the token's
+// allowed set, load the rows, decrypt each, return plaintexts with
+// the storage-shape fields (Nonce, DEKVersion) zeroed.
+//
+// Defense in depth: the transport layer also verifies the token and
+// performs per-ID scope checks. The service repeats both because
+// future surfaces (REST gateway, internal admin tooling) may also
+// call FetchForWorker, and the service should not assume the
+// transport is the only authority on authorization. The cost is one
+// signature verify + len(ids) map lookups per call.
+//
+// Reject-whole semantics (ADR 0007 §38):
+//   - If any requested ID is not in the grant's credential_ids
+//     claim, the whole request fails with ErrUnauthorized.
+//   - If any requested ID does not exist in storage, the whole
+//     request fails with ErrNotFound. Partial responses would leak
+//     existence of credentials the caller wasn't supposed to know
+//     about.
+//   - If decryption of any row fails (auth-tag mismatch, KMS
+//     failure), the whole request fails. A worker that receives a
+//     partial result cannot start its job; failing whole is
+//     strictly cleaner than returning a subset.
+//
+// TODO(provider PRD): sync-on-stale OAuth refresh fires here. After
+// decrypt, if the plaintext is an OAuth payload and the access
+// token is near expiry, call Provider.Refresh and persist the
+// rotated credential before returning to the worker. ADR 0006 §4
+// (updated 2026-05-16) reverses the original no-sync-fallback
+// stance. Providers don't exist yet; slot is identified.
+func (s *Service) FetchForWorker(
+	ctx context.Context,
+	grantToken string,
+	ids []string,
+) ([]Credential, error) {
+	userID, allowedIDs, err := s.verifier.Verify(grantToken)
+	if err != nil {
+		return nil, err
+	}
+
+	allowed := make(map[string]struct{}, len(allowedIDs))
+	for _, id := range allowedIDs {
+		allowed[id] = struct{}{}
+	}
+	for _, id := range ids {
+		if _, ok := allowed[id]; !ok {
+			return nil, ErrUnauthorized
+		}
+	}
+
+	ciphertextDEK, _, err := s.tenants.GetEncryptedDEK(ctx, userID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, ErrTenantNotProvisioned
+		}
+		return nil, fmt.Errorf("vault: fetch tenant: %w", err)
+	}
+
+	stored, err := s.store.Get(ctx, userID, ids)
+	if err != nil {
+		return nil, err
+	}
+	if len(stored) != len(ids) {
+		// Reject-whole on any missing ID. ADR 0007 §38.
+		return nil, ErrNotFound
+	}
+
+	out := make([]Credential, len(stored))
+	for i, c := range stored {
+		plaintext, err := s.cryptor.Decrypt(
+			ctx, userID, c.ID, c.Provider,
+			c.Secret.Reveal(), c.Nonce, ciphertextDEK,
+		)
+		if err != nil {
+			// Fail-whole on decrypt failure. Returning the rows that
+			// happened to decrypt would let an attacker who can tamper
+			// with a single row probe which rows are tampered.
+			return nil, fmt.Errorf("vault: fetch decrypt id=%s: %w", c.ID, err)
+		}
+		out[i] = Credential{
+			ID:       c.ID,
+			Provider: c.Provider,
+			Label:    c.Label,
+			Secret:   NewSecretBlob(plaintext),
+			Metadata: c.Metadata,
+			// Nonce + DEKVersion deliberately zero — they were storage-
+			// path fields and the worker has no use for them.
+		}
+	}
+	return out, nil
 }
 
 // resolveTenantDEK returns the (ciphertextDEK, version) under which a

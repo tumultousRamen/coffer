@@ -133,3 +133,17 @@ The REST-side service methods listed in §2 are now implemented on `vault.Servic
 - **No `Provider.Validate` call at Create or Replace.** §2 expects it; deferred until the provider-adapter PRD lands. One-line addition at that time.
 
 The service layer is the call site for the future `Telemetry` and `Provider.Validate` hooks — both surfaces are kept clean in this PRD on purpose so neither lands prematurely.
+
+## Update — PRD 0006 (2026-05-17)
+
+The worker-facing gRPC surface is now implemented (`api/coffer/v1/vault.proto`, `internal/transport/grpc/`). Two deviations from §1's literal proto worth pinning:
+
+- **`Credential.secret` is `bytes`, not `google.protobuf.Struct`.** Trial scope has no provider adapters structuring the payload; a `Struct` field would require a synthetic `{"raw": "<base64>"}` wrapper that nobody benefits from. `bytes` honestly reflects what we serialize today. The migration to `Struct` (or a `oneof` per provider) is a single proto change when provider adapters land; the wire shape is stable and reviewable in the meantime. `metadata` remains `google.protobuf.Struct` (its `map[string]any` shape already matches).
+- **Per-request bound is enforced at the transport layer.** §1 specifies "reject if len > 8" — the bound now lives in `internal/transport/grpc/server.go` as `maxRequestedIDs`. Service-layer code does not re-enforce because the transport rejects with `InvalidArgument` before the service is invoked.
+
+Two additional behaviors locked in by the implementation but worth surfacing:
+
+- **§38 reject-whole rule is now enforced on the worker batch path.** Per the PRD-0004 update above, the storage port returns whichever IDs exist; PR for PRD 0006 adds the wrapper in `Service.FetchForWorker` so any unknown ID (or any unauthorized ID) fails the whole request. The `servicecontract.testFetchForWorkerRejectWholeOnMissing` and `testFetchForWorkerOutOfScopeID` scenarios pin the behavior on both memstore and Postgres.
+- **Defense in depth on grant verification.** §3's type-system read-back guard is unchanged. New: the transport layer verifies the grant once and performs per-ID scope checks; the service layer re-verifies signature + claims and re-checks per-ID scope. Cost is one extra signature verify per call (~50µs ed25519); benefit is that any future caller of `FetchForWorker` outside the gRPC transport (REST gateway, admin tooling) still cannot bypass authorization. ADR 0002's "Vault verifies signature, checks every requested `credential_id` is in the claim" is now true at both layers, not just the transport.
+
+mTLS (§ADR 0002) is **not** yet wired; ed25519 capability tokens are the only auth gate at trial scope. `cmd/vault/main.go` carries a TODO at the listener construction site noting the mTLS slot for the follow-on resilience PRD.
