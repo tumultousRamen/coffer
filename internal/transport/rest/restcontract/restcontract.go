@@ -22,12 +22,13 @@ package restcontract
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/tumultousRamen/coffer/internal/transport/rest"
 	"github.com/tumultousRamen/coffer/internal/vault"
@@ -167,7 +168,7 @@ func doDelete(t *testing.T, b Bundle, userID, id string) int {
 // --- scenarios ---
 
 func testFullLifecycle(t *testing.T, b Bundle) {
-	userID := "rc-user-" + randSuffix(t)
+	userID := newUserID(t)
 	id := mustPOST(t, b, userID, rest.CreateRequest{
 		Provider: "s3", Label: "prod", Secret: []byte("aws-secret-v1"),
 		Metadata: map[string]any{"region": "us-west-1"},
@@ -217,8 +218,8 @@ func testFullLifecycle(t *testing.T, b Bundle) {
 }
 
 func testCrossUserIsolation(t *testing.T, b Bundle) {
-	uA := "rc-A-" + randSuffix(t)
-	uB := "rc-B-" + randSuffix(t)
+	uA := newUserID(t)
+	uB := newUserID(t)
 	id := mustPOST(t, b, uA, rest.CreateRequest{
 		Provider: "s3", Label: "p", Secret: []byte("a-secret"),
 	})
@@ -234,7 +235,7 @@ func testCrossUserIsolation(t *testing.T, b Bundle) {
 }
 
 func testDuplicateProviderLabelConflict(t *testing.T, b Bundle) {
-	userID := "rc-dup-" + randSuffix(t)
+	userID := newUserID(t)
 	_ = mustPOST(t, b, userID, rest.CreateRequest{
 		Provider: "s3", Label: "p", Secret: []byte("v1"),
 	})
@@ -257,7 +258,7 @@ func testDuplicateProviderLabelConflict(t *testing.T, b Bundle) {
 }
 
 func testDeleteThenGet404(t *testing.T, b Bundle) {
-	userID := "rc-del-" + randSuffix(t)
+	userID := newUserID(t)
 	id := mustPOST(t, b, userID, rest.CreateRequest{
 		Provider: "s3", Label: "p", Secret: []byte("v"),
 	})
@@ -276,7 +277,7 @@ func testDeleteThenGet404(t *testing.T, b Bundle) {
 // confirm GetCredentialSummary still resolves (proving the row
 // survived) and that DEKVersion is unchanged from the original.
 func testReplaceUpdatesStoredSecret(t *testing.T, b Bundle) {
-	userID := "rc-repl-" + randSuffix(t)
+	userID := newUserID(t)
 	id := mustPOST(t, b, userID, rest.CreateRequest{
 		Provider: "s3", Label: "p", Secret: []byte("v1"),
 	})
@@ -294,22 +295,18 @@ func testReplaceUpdatesStoredSecret(t *testing.T, b Bundle) {
 	}
 }
 
-// randSuffix is a tiny per-scenario unique tag so cross-scenario PG
-// state cannot collide on (user_id, provider, label) uniqueness. We
-// don't use uuid here to avoid the package dependency surface in the
-// contract package — t.Name() + a counter is sufficient.
-func randSuffix(t *testing.T) string {
+// newUserID returns a fresh UUIDv7 for use as a scenario's user_id.
+// The Postgres tenants.user_id column is typed UUID NOT NULL (per
+// the ADR 0005 migration), so the contract package must hand out
+// UUIDs even though the X-User-Id header is otherwise an opaque
+// string — the storage adapter is the source of truth for the
+// shape. UUIDv7 keeps cross-scenario isolation while also being
+// time-ordered (so test-run state is easy to inspect by hand).
+func newUserID(t *testing.T) string {
 	t.Helper()
-	return fmt.Sprintf("%s-%d", t.Name(), nextSuffix())
-}
-
-var suffixCh = make(chan int, 1)
-
-func init() { suffixCh <- 0 }
-
-func nextSuffix() int {
-	n := <-suffixCh
-	n++
-	suffixCh <- n
-	return n
+	id, err := uuid.NewV7()
+	if err != nil {
+		t.Fatalf("uuid.NewV7: %v", err)
+	}
+	return id.String()
 }
