@@ -40,7 +40,7 @@ test:
 # with .env.local sourced below.
 integration:
 	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
-	  go test -tags integration -race ./internal/adapters/awskms/... ./internal/adapters/postgres/...'
+	  go test -tags integration -race ./internal/adapters/awskms/... ./internal/adapters/postgres/... ./internal/adapters/providers/...'
 
 # Apply embedded migrations (creates tenants + credentials tables).
 migrate-up:

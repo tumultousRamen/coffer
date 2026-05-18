@@ -15,6 +15,7 @@ import (
 	cgrpc "github.com/tumultousRamen/coffer/internal/transport/grpc"
 	"github.com/tumultousRamen/coffer/internal/transport/grpc/pb"
 	"github.com/tumultousRamen/coffer/internal/vault"
+	"github.com/tumultousRamen/coffer/internal/vault/providertest"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -53,7 +54,7 @@ func newRig(t *testing.T) *testRig {
 	cryptor := vault.NewCryptor(km, cache)
 	tenants := newInMemTenants()
 	store := newInMemCreds(tenants)
-	svc := vault.NewService(store, tenants, cryptor, verifier)
+	svc := vault.NewService(store, tenants, cryptor, verifier, providertest.PermissiveRegistry())
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := grpc.NewServer(grpc.ChainUnaryInterceptor(
