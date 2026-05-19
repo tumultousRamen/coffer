@@ -64,7 +64,15 @@ type TenantStore interface {
 // Refresh re-mints an expiring credential — for OAuth providers this
 // is the refresh-token flow that yields a new access token. Validate
 // performs a lightweight authentication probe at create / update time.
+//
+// NeedsScheduledRefresh discriminates the secret-store providers (S3,
+// static keys) from the broker providers (OAuth) per ADR 0001 and
+// ADR 0006. The forthcoming refresh worker enqueues a refresh_jobs row
+// on credential write iff this returns true. S3 returns false; OAuth
+// providers return true. Added now so OAuth-provider PRDs do not have
+// to retrofit the interface across N implementations.
 type Provider interface {
+	NeedsScheduledRefresh() bool
 	Refresh(ctx context.Context, c Credential) (Credential, error)
 	Validate(ctx context.Context, secret SecretBlob, metadata Metadata) error
 }

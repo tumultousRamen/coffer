@@ -23,23 +23,47 @@ import (
 // The verifier field is only consumed by FetchForWorker; REST-side
 // methods (Create/List/GetSummary/Replace/Delete) do not use it and
 // callers that only exercise the REST path may pass nil.
+//
+// The providers field is consulted on every Create and Replace to
+// (a) confirm the requested provider name is registered and
+// (b) run a lightweight authentication probe against the user's
+// secret before the vault encrypts and persists it. ADR 0006
+// commits the vault to this contract.
 type Service struct {
-	store    CredentialStore
-	tenants  TenantStore
-	cryptor  *Cryptor
-	verifier *GrantVerifier
+	store     CredentialStore
+	tenants   TenantStore
+	cryptor   *Cryptor
+	verifier  *GrantVerifier
+	providers ProviderLookup
 }
 
-// NewService composes the four collaborators into a Service.
+// NewService composes the collaborators into a Service.
 //
-// store, tenants, and cryptor are always required. verifier is
-// required only if the caller intends to invoke FetchForWorker; the
-// REST-side methods do not consult it. A nil verifier passed to a
-// service that later receives a FetchForWorker call surfaces as a
-// runtime panic — a misconfigured service is a startup-time
-// programmer error, not a request-time failure mode.
-func NewService(store CredentialStore, tenants TenantStore, cryptor *Cryptor, verifier *GrantVerifier) *Service {
-	return &Service{store: store, tenants: tenants, cryptor: cryptor, verifier: verifier}
+// store, tenants, cryptor, and providers are always required.
+// verifier is required only if the caller intends to invoke
+// FetchForWorker; the REST-side methods do not consult it. A nil
+// verifier passed to a service that later receives a FetchForWorker
+// call surfaces as a runtime panic — a misconfigured service is a
+// startup-time programmer error, not a request-time failure mode.
+//
+// Tests substitute a permissive ProviderLookup (every Get returns a
+// no-op provider) so the existing Service-tier scenarios stay
+// offline; the strict map-backed ProviderRegistry is used in
+// production from cmd/vault/main.go.
+func NewService(
+	store CredentialStore,
+	tenants TenantStore,
+	cryptor *Cryptor,
+	verifier *GrantVerifier,
+	providers ProviderLookup,
+) *Service {
+	return &Service{
+		store:     store,
+		tenants:   tenants,
+		cryptor:   cryptor,
+		verifier:  verifier,
+		providers: providers,
+	}
 }
 
 // CreateCredential orchestrates the full create flow: provision the
@@ -65,6 +89,18 @@ func (s *Service) CreateCredential(
 	plaintextSecret []byte,
 	metadata Metadata,
 ) (string, error) {
+	// Provider lookup + Validate runs *before* tenant provisioning,
+	// DEK lookup, or any persistence. A POST with a bad provider
+	// name or invalid AWS keys is rejected without provisioning a
+	// tenants row (avoids polluting the table on every garbage POST).
+	p, err := s.providers.Get(provider)
+	if err != nil {
+		return "", err
+	}
+	if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
+		return "", err
+	}
+
 	id := uuid.Must(uuid.NewV7()).String()
 
 	ciphertextDEK, version, err := s.resolveTenantDEK(ctx, userID)
@@ -149,6 +185,18 @@ func (s *Service) ReplaceCredential(
 	}
 	if len(existing) == 0 {
 		return ErrNotFound
+	}
+
+	// Validate the replacement secret against the existing row's
+	// provider before re-encrypting. Without this, a PUT could land
+	// broken credentials onto a working ID and silently break every
+	// subsequent worker fetch (ADR 0006).
+	p, err := s.providers.Get(existing[0].Provider)
+	if err != nil {
+		return err
+	}
+	if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
+		return err
 	}
 
 	ciphertextDEK, version, err := s.tenants.GetEncryptedDEK(ctx, userID)

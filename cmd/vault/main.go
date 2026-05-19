@@ -29,8 +29,10 @@ import (
 
 	"github.com/tumultousRamen/coffer/internal/adapters/awskms"
 	"github.com/tumultousRamen/coffer/internal/adapters/postgres"
+	s3provider "github.com/tumultousRamen/coffer/internal/adapters/providers/s3"
 	cgrpc "github.com/tumultousRamen/coffer/internal/transport/grpc"
 	"github.com/tumultousRamen/coffer/internal/transport/grpc/pb"
+	"github.com/tumultousRamen/coffer/internal/transport/rest"
 	"github.com/tumultousRamen/coffer/internal/vault"
 
 	"golang.org/x/sync/errgroup"
@@ -82,8 +84,17 @@ func run(ctx context.Context, logger *slog.Logger, cfg *Config) error {
 	cache := vault.NewDEKCache(cfg.DEKCacheMaxItems, cfg.DEKCacheTTL)
 	cryptor := vault.NewCryptor(km, cache)
 	verifier := vault.NewGrantVerifier(cfg.GrantPubKey)
-	svc := vault.NewService(store, tenants, cryptor, verifier)
-	logger.Info("vault service ready")
+
+	// Provider registry: one Register call per known provider, all
+	// wired here at the composition root. Adding Dropbox / GDrive /
+	// Box later is one new import + one Register line. ADR 0001's
+	// per-provider mode discrimination lives inside each adapter's
+	// NeedsScheduledRefresh().
+	providers := vault.NewProviderRegistry()
+	providers.Register("s3", s3provider.New())
+
+	svc := vault.NewService(store, tenants, cryptor, verifier, providers)
+	logger.Info("vault service ready", "providers", []string{"s3"})
 
 	// 4. gRPC server.
 	grpcSrv := grpc.NewServer(
@@ -101,15 +112,25 @@ func run(ctx context.Context, logger *slog.Logger, cfg *Config) error {
 		return fmt.Errorf("grpc listen %s: %w", cfg.GRPCListen, err)
 	}
 
-	// 5. HTTP server: /healthz + /readyz.
-	healthMux := http.NewServeMux()
-	healthMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	// 5. HTTP server: /healthz + /readyz + REST credential lifecycle
+	// (ADR 0007 §2; PRD 0007). All routes share one ServeMux, one
+	// listener, one graceful-shutdown path. Trial-mode REST auth is
+	// the X-User-Id header — production gateway will JWT-verify and
+	// inject this. mTLS on this listener is the same follow-on PRD
+	// as gRPC mTLS (see TODO at file head).
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	healthMux.HandleFunc("/readyz", readyzHandler(db, kmsClient, cfg.KMSKeyID))
+	httpMux.HandleFunc("/readyz", readyzHandler(db, kmsClient, cfg.KMSKeyID))
+	rest.NewHandler(svc, logger).Register(httpMux)
 	httpSrv := &http.Server{
-		Addr:    cfg.HTTPListen,
-		Handler: healthMux,
+		Addr:              cfg.HTTPListen,
+		Handler:           httpMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// 6. Serve both, shut down on context cancel.
