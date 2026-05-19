@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check proto run
+.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check proto run keygen
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -90,6 +90,13 @@ proto:
 run:
 	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
 	  go run ./cmd/vault'
+
+# Generate an ed25519 keypair for trial-mode capability-token signing.
+# PUBLIC half → COFFER_GRANT_PUBKEY_PEM (vault verifies). PRIVATE half
+# → wherever the demo / control plane mints tokens. Production keys
+# come from the control plane; this target is dev-only.
+keygen:
+	@go run ./cmd/keygen
 
 # Aggregate gate run by the PR template.
 check: test check-imports
