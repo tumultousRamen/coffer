@@ -24,12 +24,20 @@ type KeyManager interface {
 // already present. Replace returns ErrNotFound if the target ID does
 // not exist; it replaces the secret payload atomically (ADR 0007 §5).
 // Delete is a hard delete (ADR 0005).
+//
+// MarkFailed transitions an existing credential to status='failed' and
+// stores a short, human-readable reason on the row. Used by the
+// sync-on-stale OAuth refresh path (PRD 0010) when the provider returns
+// a permanent error (e.g. invalid_grant); it lets subsequent
+// FetchForWorker reads short-circuit without re-hitting the provider.
+// Returns ErrNotFound if the target ID does not exist.
 type CredentialStore interface {
 	Get(ctx context.Context, userID string, ids []string) ([]Credential, error)
 	List(ctx context.Context, userID string) ([]CredentialSummary, error)
 	Create(ctx context.Context, userID string, c Credential) error
 	Replace(ctx context.Context, userID string, c Credential) error
 	Delete(ctx context.Context, userID, id string) error
+	MarkFailed(ctx context.Context, userID, id, reason string) error
 }
 
 // TenantStore is the seam to the per-tenant DEK wrapper store

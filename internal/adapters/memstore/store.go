@@ -16,9 +16,10 @@ import (
 )
 
 type record struct {
-	cred      vault.Credential
-	status    vault.Status
-	createdAt time.Time
+	cred            vault.Credential
+	status          vault.Status
+	validationError string
+	createdAt       time.Time
 }
 
 // Store is an in-memory CredentialStore. The zero value is not usable;
@@ -77,11 +78,12 @@ func (s *Store) List(_ context.Context, userID string) ([]vault.CredentialSummar
 	out := make([]vault.CredentialSummary, 0, len(bucket))
 	for _, rec := range bucket {
 		out = append(out, vault.CredentialSummary{
-			ID:        rec.cred.ID,
-			Provider:  rec.cred.Provider,
-			Label:     rec.cred.Label,
-			Status:    rec.status,
-			CreatedAt: rec.createdAt,
+			ID:              rec.cred.ID,
+			Provider:        rec.cred.Provider,
+			Label:           rec.cred.Label,
+			Status:          rec.status,
+			ValidationError: rec.validationError,
+			CreatedAt:       rec.createdAt,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -148,6 +150,27 @@ func (s *Store) Replace(_ context.Context, userID string, c vault.Credential) er
 		status:    existing.status,
 		createdAt: existing.createdAt,
 	}
+	return nil
+}
+
+// MarkFailed transitions the row's status to 'failed' and stores the
+// supplied reason on the record. ErrNotFound if the target does not
+// exist. Used by the sync-on-stale OAuth refresh path (PRD 0010).
+func (s *Store) MarkFailed(_ context.Context, userID, id, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bucket, ok := s.data[userID]
+	if !ok {
+		return vault.ErrNotFound
+	}
+	rec, ok := bucket[id]
+	if !ok {
+		return vault.ErrNotFound
+	}
+	rec.status = vault.StatusFailed
+	rec.validationError = reason
+	bucket[id] = rec
 	return nil
 }
 

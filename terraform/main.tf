@@ -295,9 +295,32 @@ resource "aws_security_group" "alb" {
   tags = merge(local.tags, { Name = "${local.name}-alb" })
 }
 
+resource "aws_security_group" "nlb" {
+  name        = "${local.name}-nlb"
+  description = "coffer gRPC NLB ingress"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "gRPC (h2c) from anywhere"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.tags, { Name = "${local.name}-nlb" })
+}
+
 resource "aws_security_group" "tasks" {
   name        = "${local.name}-tasks"
-  description = "coffer ECS tasks ingress from ALB only"
+  description = "coffer ECS tasks ingress from ALB (REST) and NLB (gRPC)"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -309,11 +332,11 @@ resource "aws_security_group" "tasks" {
   }
 
   ingress {
-    description     = "gRPC from ALB"
+    description     = "gRPC from NLB"
     from_port       = 8443
     to_port         = 8443
     protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+    security_groups = [aws_security_group.nlb.id]
   }
 
   egress {
@@ -361,24 +384,31 @@ resource "aws_lb_target_group" "http" {
 }
 
 resource "aws_lb_target_group" "grpc" {
-  name             = "${local.name}-grpc"
-  port             = 8443
-  protocol         = "HTTP"
-  protocol_version = "GRPC"
-  vpc_id           = aws_vpc.main.id
-  target_type      = "ip"
+  name        = "${local.name}-grpc"
+  port        = 8443
+  # AWS constraint: ALB HTTP listeners cannot forward to HTTP2 or GRPC
+  # protocol_version target groups (both require HTTPS). Trial has no TLS.
+  # Solution: NLB (L4 TCP) for gRPC; ALB stays for REST. NLB doesn't care
+  # about HTTP semantics; gRPC frames pass through as TCP. Worker SDK uses
+  # -plaintext (h2c). Switch to ALB + HTTPS + GRPC protocol_version when
+  # the HTTPS PRD lands (single LB; ACM cert; ALB-level gRPC routing).
+  protocol    = "TCP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
 
   health_check {
-    # The vault binary registers the standard grpc.health.v1.Health
-    # service (cmd/vault/main.go) — ALB probes it directly with
-    # protocol_version = GRPC. matcher "0" = grpc OK (SERVING).
-    path                = "/grpc.health.v1.Health/Check"
+    # NLB target groups can do HTTP health checks even when forward traffic
+    # is TCP. We probe /healthz on the REST port (8080) — same handler the
+    # ALB probes. Container stays healthy iff Postgres + KMS are reachable
+    # (per cmd/vault/main.go readyz logic; healthz is liveness-only).
     protocol            = "HTTP"
+    port                = "8080"
+    path                = "/healthz"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     interval            = 30
     timeout             = 5
-    matcher             = "0"
+    matcher             = "200"
   }
 
   tags = local.tags
@@ -395,21 +425,30 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# gRPC routing rule. Matches the proto package path
-# /coffer.v1.Vault/<method> and forwards to the HTTP/2 target group.
-resource "aws_lb_listener_rule" "grpc" {
-  listener_arn = aws_lb_listener.http.arn
-  priority     = 100
+# ────────────────────────────────────────────────────────────────────
+# NLB + listener for gRPC (separate from ALB; see grpc target group
+# comment for the AWS-constraint reasoning).
+# ────────────────────────────────────────────────────────────────────
 
-  action {
+resource "aws_lb" "grpc" {
+  name                             = "${local.name}-grpc"
+  internal                         = false
+  load_balancer_type               = "network"
+  security_groups                  = [aws_security_group.nlb.id]
+  subnets                          = aws_subnet.public[*].id
+  enable_cross_zone_load_balancing = true
+
+  tags = local.tags
+}
+
+resource "aws_lb_listener" "grpc" {
+  load_balancer_arn = aws_lb.grpc.arn
+  port              = 443
+  protocol          = "TCP"
+
+  default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.grpc.arn
-  }
-
-  condition {
-    path_pattern {
-      values = ["/coffer.v1.*"]
-    }
   }
 }
 
@@ -521,7 +560,7 @@ resource "aws_ecs_service" "vault" {
     ignore_changes = [task_definition]
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.http, aws_lb_listener.grpc]
 
   tags = local.tags
 }

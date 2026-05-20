@@ -99,9 +99,40 @@ func PermissiveRegistry() vault.ProviderLookup {
 	return catchAllLookup{}
 }
 
+// FakeOAuthProvider is a test double that simulates an OAuth broker
+// provider: NeedsScheduledRefresh returns true, Validate does a basic
+// payload-shape check, and Refresh is driven by the caller-supplied
+// RefreshFunc so each scenario can program the exact response shape
+// (success with rotation, success without rotation, ErrInvalidGrant,
+// ErrTransient). Used by the PRD 0010 OAuth service-contract scenarios.
+//
+// Refresh and RefreshCalls are not thread-safe by default — scenarios
+// that exercise concurrency (single-flight) protect access with a
+// sync.Mutex via the safe-counter pattern; see oauth_scenarios.go.
+type FakeOAuthProvider struct {
+	RefreshFunc  func(ctx context.Context, c vault.Credential) (vault.Credential, error)
+	ValidateErr  error
+	RefreshCalls int
+}
+
+func (f *FakeOAuthProvider) NeedsScheduledRefresh() bool { return true }
+
+func (f *FakeOAuthProvider) Validate(_ context.Context, _ vault.SecretBlob, _ vault.Metadata) error {
+	return f.ValidateErr
+}
+
+func (f *FakeOAuthProvider) Refresh(ctx context.Context, c vault.Credential) (vault.Credential, error) {
+	f.RefreshCalls++
+	if f.RefreshFunc != nil {
+		return f.RefreshFunc(ctx, c)
+	}
+	return c, nil
+}
+
 // Compile-time guarantees.
 var (
 	_ vault.Provider       = PermissiveProvider{}
 	_ vault.Provider       = (*ConfigurableProvider)(nil)
+	_ vault.Provider       = (*FakeOAuthProvider)(nil)
 	_ vault.ProviderLookup = catchAllLookup{}
 )

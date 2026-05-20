@@ -15,3 +15,11 @@ scratch.md
 
 # OS
 .DS_Store
+
+# Terraform — local plugin cache + state. Lock files (.terraform.lock.hcl)
+# DO get committed (provider version pinning). Bootstrap state stays local
+# per ADR 0009 §Implementation Decisions.
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup

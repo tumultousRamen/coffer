@@ -31,6 +31,16 @@ func TestPostgres_ProviderScenarios(t *testing.T) {
 	})
 }
 
+// TestPostgres_OAuthScenarios exercises the PRD 0010 OAuth-specific
+// scenarios against the Postgres adapter. The Postgres run gives the
+// strongest evidence that single-flight's transactional Replace + the
+// MarkFailed status transition land atomically under a real DB.
+func TestPostgres_OAuthScenarios(t *testing.T) {
+	servicecontract.RunOAuthScenarios(t, func(t *testing.T, lookup vault.ProviderLookup) servicecontract.Bundle {
+		return newPostgresBundle(t, lookup)
+	})
+}
+
 func newPostgresBundle(t *testing.T, lookup vault.ProviderLookup) servicecontract.Bundle {
 	t.Helper()
 	db := openTestDB(t)

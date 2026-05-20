@@ -78,7 +78,7 @@ func (s *CredentialStore) Get(ctx context.Context, userID string, ids []string) 
 // List returns CredentialSummary rows for userID, ordered by id.
 func (s *CredentialStore) List(ctx context.Context, userID string) ([]vault.CredentialSummary, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, provider, label, status, created_at
+		SELECT id, provider, label, status, validation_error, created_at
 		FROM credentials
 		WHERE user_id = $1
 		ORDER BY id
@@ -92,7 +92,7 @@ func (s *CredentialStore) List(ctx context.Context, userID string) ([]vault.Cred
 	for rows.Next() {
 		var sum vault.CredentialSummary
 		var status string
-		if err := rows.Scan(&sum.ID, &sum.Provider, &sum.Label, &status, &sum.CreatedAt); err != nil {
+		if err := rows.Scan(&sum.ID, &sum.Provider, &sum.Label, &status, &sum.ValidationError, &sum.CreatedAt); err != nil {
 			return nil, fmt.Errorf("postgres: scan summary: %w", err)
 		}
 		sum.Status = vault.Status(status)
@@ -156,6 +156,30 @@ func (s *CredentialStore) Replace(ctx context.Context, userID string, c vault.Cr
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: update credential: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("postgres: rows affected: %w", err)
+	}
+	if n == 0 {
+		return vault.ErrNotFound
+	}
+	return nil
+}
+
+// MarkFailed transitions the row's status to 'failed' and stamps a
+// short reason in validation_error. Zero rows updated → ErrNotFound.
+// Used by the sync-on-stale OAuth refresh path (PRD 0010).
+func (s *CredentialStore) MarkFailed(ctx context.Context, userID, id, reason string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE credentials
+		SET status           = $1,
+		    validation_error = $2,
+		    updated_at       = now()
+		WHERE id = $3 AND user_id = $4
+	`, string(vault.StatusFailed), reason, id, userID)
+	if err != nil {
+		return fmt.Errorf("postgres: mark failed: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {

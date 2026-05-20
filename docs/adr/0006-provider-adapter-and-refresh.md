@@ -1,5 +1,19 @@
 # ADR 0006 — Provider Adapter & OAuth Refresh Strategy
 
+> **Update — PRD 0010 (2026-05-20).** The sync-on-stale fallback
+> described in §4 is now wired at `Service.FetchForWorker` against
+> three OAuth providers (Dropbox, Google Drive, Box) sharing a common
+> `oauth2/` client. Single-flight per `(userID, credentialID)`
+> coalesces concurrent stale reads to one provider call. Refresh-token
+> rotation (load-bearing for Box per §"Refresh-token rotation") is
+> persisted atomically via `CredentialStore.Replace`. Permanent
+> failures (`invalid_grant`) transition the row to `status='failed'`
+> via a new `CredentialStore.MarkFailed` method and a new
+> `validation_error` column (migration `0002_validation_error`). The
+> refresh worker (PRD 0011) is still outstanding — until it lands,
+> sync-on-stale IS the primary refresh path, with the SLO caveat from
+> §3 in force.
+
 S3 credentials are static; OAuth credentials (Dropbox, Google Drive, Box) expire and must be refreshed using a long-lived refresh token. The 50ms read P99 SLO ([PRD §2](../PRD.md)) cannot routinely absorb a synchronous call to a third-party OAuth endpoint — Dropbox/Google `/oauth/token` P99 is often >800ms. The primary refresh path must therefore run out-of-band so that `GetCredentials` is, in the common case, a fast read of an already-fresh token.
 
 Refresh-policy options considered:
