@@ -2,6 +2,10 @@ name: deploy
 on:
   push:
     branches: [main]
+  # Manual trigger for the first-time bring-up: terraform apply creates
+  # the ECR repo + ECS service, but ECR is empty so the service can't
+  # pull. Running this workflow from the GH UI pushes the first image.
+  workflow_dispatch:
 
 # Serialize main deploys: a second push during an in-progress deploy
 # queues rather than racing. Cancel-in-progress would skip the older

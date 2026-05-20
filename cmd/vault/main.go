@@ -37,6 +37,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func main() {
@@ -106,6 +108,14 @@ func run(ctx context.Context, logger *slog.Logger, cfg *Config) error {
 		),
 	)
 	pb.RegisterVaultServer(grpcSrv, cgrpc.NewVaultServer(svc, verifier))
+
+	// Standard gRPC health service so the ALB target group can probe
+	// the gRPC listener directly (PRD 0009 — the gRPC target group
+	// can't health-check via HTTP /healthz on the REST port). Empty
+	// service name = overall server health.
+	hsrv := health.NewServer()
+	hsrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(grpcSrv, hsrv)
 
 	grpcLis, err := net.Listen("tcp", cfg.GRPCListen)
 	if err != nil {

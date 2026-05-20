@@ -166,8 +166,12 @@ resource "aws_cloudwatch_log_group" "vault" {
 # ────────────────────────────────────────────────────────────────────
 
 resource "aws_secretsmanager_secret" "pg_url" {
-  name                    = "coffer/pg-url"
-  description             = "Supabase pooler DSN consumed as COFFER_PG_URL. Populate via `aws secretsmanager put-secret-value` after first apply."
+  # Name matches the operator playbook (PRD 0009 comment) which sources
+  # $DATABASE_URL from .env.local and puts it under coffer/database-url.
+  # The task def below maps this secret's value into COFFER_PG_URL so the
+  # binary (which still reads its COFFER_* env var) sees no change.
+  name                    = "coffer/database-url"
+  description             = "Supabase pooler DSN. Mapped into COFFER_PG_URL in the task def. Populate via `aws secretsmanager put-secret-value` after first apply."
   recovery_window_in_days = 0
   tags                    = local.tags
 }
@@ -360,24 +364,21 @@ resource "aws_lb_target_group" "grpc" {
   name             = "${local.name}-grpc"
   port             = 8443
   protocol         = "HTTP"
-  protocol_version = "HTTP2"
+  protocol_version = "GRPC"
   vpc_id           = aws_vpc.main.id
   target_type      = "ip"
 
   health_check {
-    # ALB health-checks the gRPC target group with HTTP/2 against
-    # /healthz on port 8443. The binary's HTTP healthz handler is on
-    # 8080, not 8443 — so we use the gRPC health check protocol
-    # matcher here. For trial, "0" through "99" matches the gRPC
-    # status code range; production should use a real grpc-health
-    # probe.
-    path                = "/healthz"
+    # The vault binary registers the standard grpc.health.v1.Health
+    # service (cmd/vault/main.go) — ALB probes it directly with
+    # protocol_version = GRPC. matcher "0" = grpc OK (SERVING).
+    path                = "/grpc.health.v1.Health/Check"
     protocol            = "HTTP"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     interval            = 30
     timeout             = 5
-    matcher             = "0-99"
+    matcher             = "0"
   }
 
   tags = local.tags
@@ -483,11 +484,16 @@ resource "aws_ecs_task_definition" "vault" {
 }
 
 resource "aws_ecs_service" "vault" {
-  name            = "${local.name}-vault"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.vault.arn
-  desired_count   = var.desired_count
-  launch_type     = "FARGATE"
+  name                              = "${local.name}-vault"
+  cluster                           = aws_ecs_cluster.main.id
+  task_definition                   = aws_ecs_task_definition.vault.arn
+  desired_count                     = var.desired_count
+  launch_type                       = "FARGATE"
+
+  # Postgres migrations run on container boot (ADR 0010 §3). Grace
+  # period stops ALB from killing the task during that ~30-60s window
+  # before the HTTP/gRPC servers are accepting traffic.
+  health_check_grace_period_seconds = 120
 
   network_configuration {
     subnets          = aws_subnet.private[*].id
