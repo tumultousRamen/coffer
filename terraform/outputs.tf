@@ -1,6 +1,11 @@
 output "alb_dns_name" {
-  description = "ALB DNS name. REST: http://<dns>/v1/credentials; gRPC: <dns>:80 with -plaintext."
+  description = "ALB DNS name. REST: http://<dns>/v1/credentials"
   value       = aws_lb.main.dns_name
+}
+
+output "nlb_dns_name" {
+  description = "NLB DNS name. gRPC: grpcurl -plaintext <dns>:443 coffer.v1.Vault/..."
+  value       = aws_lb.grpc.dns_name
 }
 
 output "ecr_repository_url" {
