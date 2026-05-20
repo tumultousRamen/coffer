@@ -70,8 +70,8 @@ The Terraform stack creates empty Secrets Manager entries. Populate them with th
 set -a; source ../.env.local; set +a
 
 aws secretsmanager put-secret-value \
-  --secret-id coffer/pg-url \
-  --secret-string "$COFFER_PG_URL" \
+  --secret-id coffer/database-url \
+  --secret-string "$DATABASE_URL" \
   --region us-west-1
 
 aws secretsmanager put-secret-value \
@@ -80,15 +80,43 @@ aws secretsmanager put-secret-value \
   --region us-west-1
 ```
 
-Force a fresh task so the secrets are read:
+The task def maps `coffer/database-url` → env var `COFFER_PG_URL` inside the container; the binary keeps reading `COFFER_PG_URL` unchanged.
+
+## 4a. Push the first image (chicken-and-egg fix)
+
+After §3 the ECS service exists but ECR is empty — tasks crash-loop on `ImagePullBackOff`. Trigger `deploy.yml` once manually to push the first image:
+
+```bash
+# Option A — from the GH CLI:
+gh workflow run deploy.yml --ref main
+
+# Option B — from the GH UI:
+#   Actions → deploy → Run workflow → main
+```
+
+Or push manually if you'd rather not wait for a CI run:
+
+```bash
+ECR=$(terraform output -raw ecr_repository_url)
+aws ecr get-login-password --region us-west-1 \
+  | docker login --username AWS --password-stdin "$ECR"
+docker build -t "$ECR:latest" .
+docker push "$ECR:latest"
+```
+
+Then force a fresh task so it picks up both the image and the now-populated secrets:
 
 ```bash
 aws ecs update-service \
   --cluster coffer --service coffer-vault \
   --force-new-deployment --region us-west-1
+
+aws ecs wait services-stable \
+  --cluster coffer --services coffer-vault \
+  --region us-west-1
 ```
 
-Wait ~60 seconds for the task to become healthy. Verify:
+Verify:
 
 ```bash
 ALB_DNS=$(terraform output -raw alb_dns_name)

@@ -29,8 +29,8 @@ After apply, populate Secrets Manager and roll the service:
 
 ```bash
 aws secretsmanager put-secret-value \
-  --secret-id coffer/pg-url \
-  --secret-string "$COFFER_PG_URL" \
+  --secret-id coffer/database-url \
+  --secret-string "$DATABASE_URL" \
   --region us-west-1
 aws secretsmanager put-secret-value \
   --secret-id coffer/grant-pubkey-pem \
