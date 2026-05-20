@@ -1,0 +1,53 @@
+name: test
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]   # main is covered by deploy.yml (which also runs tests pre-build).
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for OIDC role assumption (integration tests)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Unit tests
+        run: go test -race ./...
+
+      - name: Hexagonal import gate
+        run: make check-imports
+
+      # Integration tests are gated on (a) the PR coming from the
+      # trusted repo (not a fork — secrets aren't available there),
+      # and (b) the test role being set in repo vars. Skips cleanly
+      # otherwise.
+      - name: Configure AWS credentials (OIDC)
+        if: |
+          github.event_name == 'push' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.COFFER_TEST_ROLE_ARN }}
+          aws-region: us-west-1
+
+      - name: Integration tests
+        if: |
+          (github.event_name == 'push' ||
+           github.event.pull_request.head.repo.full_name == github.repository) &&
+          vars.COFFER_TEST_ROLE_ARN != ''
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_TEST }}
+        run: |
+          # The Makefile's `integration` target reads DATABASE_URL
+          # from .env.local; CI sets it as a job env var instead so
+          # the per-adapter self-gate (TestMain) still applies.
+          go test -tags integration -race \
+            ./internal/adapters/awskms/... \
+            ./internal/adapters/postgres/... \
+            ./internal/adapters/providers/...

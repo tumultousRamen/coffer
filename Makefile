@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check proto run keygen
+.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check proto run keygen gen-keys mint-grant sanity-test docker-build docker-run
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -98,5 +98,55 @@ run:
 keygen:
 	@go run ./cmd/keygen
 
+# Alias for `make keygen`. PRD 0008.5 / local-sanity runbook refer to
+# this name; keep both so older docs and the runbook both work.
+gen-keys: keygen
+
+# Mint a capability token via cmd/mint-grant. Wraps vault.MintGrant
+# (see docs/runbook/local-sanity.md §5). Reads COFFER_GRANT_PRIVKEY_PEM
+# from .env.local; flags pin user-id, credential-ids, ttl. Prints the
+# JWT to stdout with no trailing newline so it pipes cleanly:
+#
+#   TOKEN=$$(make mint-grant USER=divya-test IDS=01928abc... TTL=15m)
+#
+mint-grant:
+	@if [ -z "$$USER" ] || [ -z "$$IDS" ]; then \
+	  echo "Usage: make mint-grant USER=<user-id> IDS=<id1,id2,...> [TTL=15m]"; exit 1; fi
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  go run ./cmd/mint-grant --user-id "$$USER" --ids "$$IDS" --ttl "$${TTL:-15m}"'
+
+# Walk the full REST lifecycle against a running `make run`. Reads
+# real S3 keys from COFFER_TEST_AWS_* env vars (see runbook). Prints
+# PASS/FAIL per step; exits non-zero on first failure.
+sanity-test:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  bash scripts/sanity-test.sh'
+
 # Aggregate gate run by the PR template.
 check: test check-imports
+
+# Build the production Docker image (PRD 0009). Distroless final
+# stage; ~25-30 MB. Same artifact the GH Actions deploy workflow
+# pushes to ECR; building locally verifies the Dockerfile before
+# pushing to main.
+docker-build:
+	docker build -t coffer-vault:latest .
+
+# Run the just-built image against .env.local. Maps the same ports
+# as `make run` so scripts/sanity-test.sh works against it
+# unchanged. Requires AWS credentials reachable from the container:
+# the simplest path is to mount ~/.aws read-only.
+docker-run:
+	@bash -c 'set -a; [ -f .env.local ] && source .env.local; set +a; \
+	  docker run --rm -it \
+	    -p 8080:8080 -p 8443:8443 \
+	    -e COFFER_PG_URL \
+	    -e COFFER_AWS_REGION \
+	    -e COFFER_AWS_KMS_KEY_ID \
+	    -e COFFER_GRANT_PUBKEY_PEM \
+	    -e AWS_ACCESS_KEY_ID \
+	    -e AWS_SECRET_ACCESS_KEY \
+	    -e AWS_SESSION_TOKEN \
+	    -e AWS_PROFILE \
+	    -v $$HOME/.aws:/home/nonroot/.aws:ro \
+	    coffer-vault:latest'
