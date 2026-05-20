@@ -29,6 +29,9 @@ import (
 
 	"github.com/tumultousRamen/coffer/internal/adapters/awskms"
 	"github.com/tumultousRamen/coffer/internal/adapters/postgres"
+	boxprovider "github.com/tumultousRamen/coffer/internal/adapters/providers/box"
+	dropboxprovider "github.com/tumultousRamen/coffer/internal/adapters/providers/dropbox"
+	gdriveprovider "github.com/tumultousRamen/coffer/internal/adapters/providers/gdrive"
 	s3provider "github.com/tumultousRamen/coffer/internal/adapters/providers/s3"
 	cgrpc "github.com/tumultousRamen/coffer/internal/transport/grpc"
 	"github.com/tumultousRamen/coffer/internal/transport/grpc/pb"
@@ -88,15 +91,33 @@ func run(ctx context.Context, logger *slog.Logger, cfg *Config) error {
 	verifier := vault.NewGrantVerifier(cfg.GrantPubKey)
 
 	// Provider registry: one Register call per known provider, all
-	// wired here at the composition root. Adding Dropbox / GDrive /
-	// Box later is one new import + one Register line. ADR 0001's
-	// per-provider mode discrimination lives inside each adapter's
-	// NeedsScheduledRefresh().
+	// wired here at the composition root. ADR 0001's per-provider mode
+	// discrimination lives inside each adapter's NeedsScheduledRefresh().
+	//
+	// OAuth providers (Dropbox, Google Drive, Box per PRD 0010) are
+	// registered conditionally on their app credentials being present
+	// in env. A deployment without (e.g.) Box app credentials simply
+	// does not register the Box provider; POSTs with provider=box
+	// then return 400 ErrProviderUnknown — clear at registration time
+	// rather than a runtime failure later.
 	providers := vault.NewProviderRegistry()
 	providers.Register("s3", s3provider.New())
+	registered := []string{"s3"}
+	if cid := os.Getenv("COFFER_DROPBOX_CLIENT_ID"); cid != "" {
+		providers.Register("dropbox", dropboxprovider.New(cid, os.Getenv("COFFER_DROPBOX_CLIENT_SECRET")))
+		registered = append(registered, "dropbox")
+	}
+	if cid := os.Getenv("COFFER_GDRIVE_CLIENT_ID"); cid != "" {
+		providers.Register("gdrive", gdriveprovider.New(cid, os.Getenv("COFFER_GDRIVE_CLIENT_SECRET")))
+		registered = append(registered, "gdrive")
+	}
+	if cid := os.Getenv("COFFER_BOX_CLIENT_ID"); cid != "" {
+		providers.Register("box", boxprovider.New(cid, os.Getenv("COFFER_BOX_CLIENT_SECRET")))
+		registered = append(registered, "box")
+	}
 
 	svc := vault.NewService(store, tenants, cryptor, verifier, providers)
-	logger.Info("vault service ready", "providers", []string{"s3"})
+	logger.Info("vault service ready", "providers", registered)
 
 	// 4. gRPC server.
 	grpcSrv := grpc.NewServer(

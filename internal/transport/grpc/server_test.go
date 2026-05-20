@@ -429,6 +429,15 @@ func (s *inMemCreds) Delete(_ context.Context, userID, id string) error {
 	return nil
 }
 
+func (s *inMemCreds) MarkFailed(_ context.Context, userID, id, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.rows[userID][id]; !ok {
+		return vault.ErrNotFound
+	}
+	return nil
+}
+
 var (
 	_ vault.CredentialStore = (*inMemCreds)(nil)
 	_ vault.TenantStore     = (*inMemTenants)(nil)

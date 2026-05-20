@@ -26,4 +26,20 @@ var (
 	//
 	//	fmt.Errorf("%w: %v", vault.ErrProviderValidation, awsErr)
 	ErrProviderValidation = errors.New("vault: provider rejected credential")
+
+	// ErrProviderRefreshPermanent is wrapped by Provider.Refresh when
+	// the provider has issued a terminal verdict on the credential
+	// (e.g. OAuth invalid_grant — the refresh_token has been revoked
+	// or rejected and cannot be recovered without re-authorization).
+	// The Service's sync-on-stale path at FetchForWorker checks for
+	// this via errors.Is and transitions the credential to
+	// status='failed' so subsequent reads short-circuit. Per PRD 0010
+	// §4.
+	ErrProviderRefreshPermanent = errors.New("vault: provider refresh permanent failure")
+
+	// ErrProviderRefreshTransient is wrapped by Provider.Refresh for
+	// retryable failures (5xx, network errors, anything the adapter
+	// could not confidently classify as permanent). The Service
+	// propagates this so the worker can retry per ADR 0008 §3.
+	ErrProviderRefreshTransient = errors.New("vault: provider refresh transient failure")
 )

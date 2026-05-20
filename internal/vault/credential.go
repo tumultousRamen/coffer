@@ -43,10 +43,29 @@ type Credential struct {
 // CredentialSummary is the user-facing projection of a credential. It
 // deliberately has no Secret field — REST handlers return this type so
 // the compile-time guarantee from ADR 0007 §3 holds.
+//
+// ValidationError carries the operator-side reason a credential was
+// marked failed (PRD 0010 sync-on-stale path). Empty for active
+// credentials.
 type CredentialSummary struct {
-	ID        string
-	Provider  string
-	Label     string
-	Status    Status
-	CreatedAt time.Time
+	ID              string
+	Provider        string
+	Label           string
+	Status          Status
+	ValidationError string
+	CreatedAt       time.Time
 }
+
+// MetadataKeyAccessTokenExpiresAt is the reserved metadata key that
+// OAuth providers (Dropbox, Google Drive, Box) populate with the
+// absolute expiry time of the cached access_token, formatted RFC3339.
+// Sync-on-stale at FetchForWorker reads this key without decrypting the
+// secret to decide whether a refresh is due.
+const MetadataKeyAccessTokenExpiresAt = "access_token_expires_at"
+
+// OAuthSkewMargin is the lead time before the persisted
+// access_token_expires_at at which the sync-on-stale path treats a
+// token as already stale and triggers a refresh. 30 seconds is chosen
+// to absorb the round-trip a worker incurs handing the token to the
+// vendor API after the vault returns. Per PRD 0010 §4.
+const OAuthSkewMargin = 30 * time.Second

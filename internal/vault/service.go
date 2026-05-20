@@ -13,9 +13,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 )
+
+// ErrCredentialUnusable surfaces from FetchForWorker when the vault has
+// determined a credential cannot be used and has transitioned the row
+// to status='failed'. Distinct from a transient refresh failure (which
+// returns a wrapped transient error); ErrCredentialUnusable means the
+// worker should not retry. Used by the sync-on-stale OAuth refresh
+// path (PRD 0010 §4).
+var ErrCredentialUnusable = errors.New("vault: credential marked failed")
 
 // Service holds the wiring needed to drive credential lifecycle. The
 // zero value is not usable; construct with NewService.
@@ -29,12 +39,22 @@ import (
 // (b) run a lightweight authentication probe against the user's
 // secret before the vault encrypts and persists it. ADR 0006
 // commits the vault to this contract.
+//
+// refreshGroup coalesces concurrent sync-on-stale OAuth refreshes per
+// (userID, credentialID) so one expired credential triggers one provider
+// call, not N — Google explicitly rejects concurrent refreshes with
+// invalid_grant and Box invalidates the loser's token. PRD 0010 §4.
+//
+// now is injected so tests can pin the staleness check deterministically;
+// production wires time.Now in NewService.
 type Service struct {
-	store     CredentialStore
-	tenants   TenantStore
-	cryptor   *Cryptor
-	verifier  *GrantVerifier
-	providers ProviderLookup
+	store        CredentialStore
+	tenants      TenantStore
+	cryptor      *Cryptor
+	verifier     *GrantVerifier
+	providers    ProviderLookup
+	refreshGroup singleflight.Group
+	now          func() time.Time
 }
 
 // NewService composes the collaborators into a Service.
@@ -63,8 +83,13 @@ func NewService(
 		cryptor:   cryptor,
 		verifier:  verifier,
 		providers: providers,
+		now:       time.Now,
 	}
 }
+
+// SetClock injects a custom time source. Test-only; production never
+// calls this.
+func (s *Service) SetClock(now func() time.Time) { s.now = now }
 
 // CreateCredential orchestrates the full create flow: provision the
 // tenant DEK on first use (with race protection), encrypt the secret
@@ -97,11 +122,40 @@ func (s *Service) CreateCredential(
 	if err != nil {
 		return "", err
 	}
-	if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
-		return "", err
-	}
 
 	id := uuid.Must(uuid.NewV7()).String()
+
+	// Broker-mode providers (NeedsScheduledRefresh==true) use Refresh
+	// instead of Validate as their probe: the call mints a fresh
+	// access_token (cached on the row to save the first FetchForWorker
+	// a round-trip) AND, for Box, rotates the refresh_token. Validate
+	// alone cannot return the mutated secret; PRD 0010 §Implementation
+	// Decisions option (c) commits to Refresh-as-probe for these.
+	//
+	// Secret-store providers (S3) keep the existing Validate path —
+	// nothing to mutate, just an authentication probe.
+	if p.NeedsScheduledRefresh() {
+		if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
+			return "", err
+		}
+		draft := Credential{
+			ID:       id,
+			Provider: provider,
+			Label:    label,
+			Secret:   NewSecretBlob(plaintextSecret),
+			Metadata: metadata,
+		}
+		refreshed, err := p.Refresh(ctx, draft)
+		if err != nil {
+			return "", mapBrokerProbeError(err)
+		}
+		plaintextSecret = refreshed.Secret.Reveal()
+		metadata = refreshed.Metadata
+	} else {
+		if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
+			return "", err
+		}
+	}
 
 	ciphertextDEK, version, err := s.resolveTenantDEK(ctx, userID)
 	if err != nil {
@@ -191,12 +245,37 @@ func (s *Service) ReplaceCredential(
 	// provider before re-encrypting. Without this, a PUT could land
 	// broken credentials onto a working ID and silently break every
 	// subsequent worker fetch (ADR 0006).
+	//
+	// Broker-mode providers (OAuth) substitute Refresh-as-probe just
+	// like CreateCredential — the Replace must mint a fresh access_token
+	// from the user's newly-submitted refresh_token and persist any
+	// rotated value (load-bearing for Box). PRD 0010 §Implementation
+	// Decisions option (c) covers this branch in addition to Create.
 	p, err := s.providers.Get(existing[0].Provider)
 	if err != nil {
 		return err
 	}
-	if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
-		return err
+	if p.NeedsScheduledRefresh() {
+		if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
+			return err
+		}
+		draft := Credential{
+			ID:       id,
+			Provider: existing[0].Provider,
+			Label:    existing[0].Label,
+			Secret:   NewSecretBlob(plaintextSecret),
+			Metadata: metadata,
+		}
+		refreshed, err := p.Refresh(ctx, draft)
+		if err != nil {
+			return mapBrokerProbeError(err)
+		}
+		plaintextSecret = refreshed.Secret.Reveal()
+		metadata = refreshed.Metadata
+	} else {
+		if err := p.Validate(ctx, NewSecretBlob(plaintextSecret), metadata); err != nil {
+			return err
+		}
 	}
 
 	ciphertextDEK, version, err := s.tenants.GetEncryptedDEK(ctx, userID)
@@ -258,12 +337,18 @@ func (s *Service) DeleteCredential(ctx context.Context, userID, id string) error
 //     partial result cannot start its job; failing whole is
 //     strictly cleaner than returning a subset.
 //
-// TODO(provider PRD): sync-on-stale OAuth refresh fires here. After
-// decrypt, if the plaintext is an OAuth payload and the access
-// token is near expiry, call Provider.Refresh and persist the
-// rotated credential before returning to the worker. ADR 0006 §4
-// (updated 2026-05-16) reverses the original no-sync-fallback
-// stance. Providers don't exist yet; slot is identified.
+// Sync-on-stale OAuth refresh fires here (PRD 0010 §4, ADR 0006 §4).
+// After loading each row, if its Metadata carries an
+// access_token_expires_at within OAuthSkewMargin of now, the row is
+// refreshed inline via Provider.Refresh under a single-flight key
+// (userID:credentialID) so concurrent fetchers trigger one provider
+// call, not N — Google explicitly rejects concurrent refreshes and
+// Box invalidates the loser's token. On success the new ciphertext
+// (carrying any rotated refresh_token) is persisted atomically via
+// store.Replace before the plaintext goes back to the worker.
+// invalid_grant transitions the row to status='failed' via MarkFailed
+// and surfaces ErrCredentialUnusable; transient errors propagate so
+// the worker can retry per ADR 0008 §3.
 func (s *Service) FetchForWorker(
 	ctx context.Context,
 	grantToken string,
@@ -313,6 +398,20 @@ func (s *Service) FetchForWorker(
 			// with a single row probe which rows are tampered.
 			return nil, fmt.Errorf("vault: fetch decrypt id=%s: %w", c.ID, err)
 		}
+
+		// Sync-on-stale check (PRD 0010 §4). Reading expires_at from
+		// Metadata avoids a second decrypt pass; if the key is absent
+		// (S3, or a freshly-Created OAuth credential before its first
+		// refresh) the check is a no-op.
+		if s.isAccessTokenStale(c.Metadata) {
+			refreshed, err := s.refreshStale(ctx, userID, c, plaintext, ciphertextDEK)
+			if err != nil {
+				return nil, err
+			}
+			c = refreshed.stored      // for next-loop reads of c.* below
+			plaintext = refreshed.pt
+		}
+
 		out[i] = Credential{
 			ID:       c.ID,
 			Provider: c.Provider,
@@ -324,6 +423,142 @@ func (s *Service) FetchForWorker(
 		}
 	}
 	return out, nil
+}
+
+// refreshedRow bundles what the post-refresh state of a credential
+// looks like: the storage-shape row (carrying the new ciphertext +
+// nonce + dek_version) and the plaintext we serve back to the worker.
+type refreshedRow struct {
+	stored Credential
+	pt     []byte
+}
+
+// refreshStale serializes concurrent refresh attempts for a single
+// credential via singleflight, calls the provider, persists the new
+// state atomically, and returns the fresh row + plaintext. The
+// plaintextDecrypted argument is the just-decrypted secret JSON the
+// caller already has in hand — passed in so the singleflight winner
+// doesn't have to re-do the decrypt.
+func (s *Service) refreshStale(
+	ctx context.Context,
+	userID string,
+	stored Credential,
+	plaintextDecrypted []byte,
+	ciphertextDEK []byte,
+) (refreshedRow, error) {
+	key := userID + ":" + stored.ID
+	v, err, _ := s.refreshGroup.Do(key, func() (any, error) {
+		return s.refreshOnce(ctx, userID, stored, plaintextDecrypted, ciphertextDEK)
+	})
+	if err != nil {
+		return refreshedRow{}, err
+	}
+	return v.(refreshedRow), nil
+}
+
+func (s *Service) refreshOnce(
+	ctx context.Context,
+	userID string,
+	stored Credential,
+	plaintextDecrypted []byte,
+	ciphertextDEK []byte,
+) (refreshedRow, error) {
+	p, err := s.providers.Get(stored.Provider)
+	if err != nil {
+		return refreshedRow{}, fmt.Errorf("vault: refresh: provider lookup: %w", err)
+	}
+
+	draft := Credential{
+		ID:       stored.ID,
+		Provider: stored.Provider,
+		Label:    stored.Label,
+		Secret:   NewSecretBlob(plaintextDecrypted),
+		Metadata: stored.Metadata,
+	}
+	refreshed, err := p.Refresh(ctx, draft)
+	if err != nil {
+		if errors.Is(err, ErrProviderRefreshPermanent) {
+			// Mark failed so subsequent FetchForWorker reads short-circuit
+			// instead of re-burning the provider's rate limit. Best-effort:
+			// even if MarkFailed itself fails, we still surface
+			// ErrCredentialUnusable so the worker stops retrying for THIS
+			// call. The next call will re-detect staleness and try again.
+			_ = s.store.MarkFailed(ctx, userID, stored.ID, err.Error())
+			return refreshedRow{}, fmt.Errorf("%w: %v", ErrCredentialUnusable, err)
+		}
+		return refreshedRow{}, fmt.Errorf("vault: refresh: %w", err)
+	}
+
+	// Re-encrypt under the tenant's current DEK with a fresh nonce.
+	// The AAD is unchanged ((userID, id, provider) are stable across
+	// refresh) so re-encryption stays compatible with the existing AAD
+	// contract.
+	newPlaintext := refreshed.Secret.Reveal()
+	newCiphertext, newNonce, err := s.cryptor.Encrypt(
+		ctx, userID, stored.ID, stored.Provider, newPlaintext, ciphertextDEK,
+	)
+	if err != nil {
+		return refreshedRow{}, fmt.Errorf("vault: refresh: re-encrypt: %w", err)
+	}
+	updated := Credential{
+		ID:         stored.ID,
+		Provider:   stored.Provider,
+		Label:      stored.Label,
+		Secret:     NewSecretBlob(newCiphertext),
+		Metadata:   refreshed.Metadata,
+		Nonce:      newNonce,
+		DEKVersion: stored.DEKVersion,
+	}
+	if err := s.store.Replace(ctx, userID, updated); err != nil {
+		// PRD 0010 §4: this is the only Box-rotation data-loss window —
+		// the new refresh_token is in `updated` but never made it to the
+		// DB. The next FetchForWorker will refresh again using the now-
+		// invalid old refresh_token and Box will return invalid_grant,
+		// at which point we mark failed. Operationally, observability
+		// on Replace failures should alert.
+		return refreshedRow{}, fmt.Errorf("vault: refresh: persist: %w", err)
+	}
+	return refreshedRow{stored: updated, pt: newPlaintext}, nil
+}
+
+// isAccessTokenStale parses metadata's access_token_expires_at and
+// returns true if it's within OAuthSkewMargin of now (or in the past).
+// A missing key is treated as not-stale — credentials without an
+// access_token cache (e.g. fresh S3 rows) skip the refresh path.
+func (s *Service) isAccessTokenStale(md Metadata) bool {
+	raw, ok := md[MetadataKeyAccessTokenExpiresAt]
+	if !ok {
+		return false
+	}
+	str, ok := raw.(string)
+	if !ok || str == "" {
+		return false
+	}
+	expiry, err := time.Parse(time.RFC3339, str)
+	if err != nil {
+		// Unparseable expiry shouldn't happen — we wrote it ourselves.
+		// Treat as stale so the next refresh overwrites it with a
+		// well-formed value rather than serving a credential whose
+		// expiry we can't reason about.
+		return true
+	}
+	return s.now().Add(OAuthSkewMargin).After(expiry)
+}
+
+// mapBrokerProbeError translates a provider Refresh error returned
+// during the Create/Replace probe path to the vault error shape REST
+// expects (ErrProviderValidation surfaces as 422 with the wrapped
+// reason). Both permanent and transient provider failures fail Create —
+// the user is asking us to persist a credential we couldn't probe —
+// so they bin together at this call site.
+func mapBrokerProbeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrProviderRefreshPermanent) || errors.Is(err, ErrProviderRefreshTransient) {
+		return fmt.Errorf("%w: %v", ErrProviderValidation, err)
+	}
+	return err
 }
 
 // resolveTenantDEK returns the (ciphertextDEK, version) under which a

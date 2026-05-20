@@ -27,6 +27,17 @@ func TestMemstore_ProviderScenarios(t *testing.T) {
 	})
 }
 
+// TestMemstore_OAuthScenarios drives the PRD 0010 OAuth-specific
+// scenarios: broker-mode Create probe persists fresh tokens, sync-on-
+// stale at FetchForWorker triggers Refresh + atomic Replace, single-
+// flight coalesces concurrent reads, invalid_grant transitions to
+// failed, Box rotation is persisted atomically.
+func TestMemstore_OAuthScenarios(t *testing.T) {
+	servicecontract.RunOAuthScenarios(t, func(t *testing.T, lookup vault.ProviderLookup) servicecontract.Bundle {
+		return newMemstoreBundle(t, lookup)
+	})
+}
+
 func newMemstoreBundle(t *testing.T, lookup vault.ProviderLookup) servicecontract.Bundle {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
