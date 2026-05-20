@@ -1,0 +1,32 @@
+# Keep the build context tight: only source code + go.mod/go.sum need
+# to ship to the build stage. Everything else is local-dev or CI-only.
+
+.git
+.github
+.scratch
+.env*
+!.env.local.example
+
+# IDE / OS junk
+.vscode
+.idea
+.DS_Store
+
+# Local-only artifacts
+*.tfstate
+*.tfstate.*
+.terraform
+.terraform.lock.hcl
+terraform/
+
+# Docs + runbooks don't affect the binary
+docs/
+README.md
+CLAUDE.md
+scratch.md
+
+# Helper scripts run from the host, not in the container
+scripts/
+
+# Example envs (we already exclude .env* above, but be explicit)
+.env.local.example

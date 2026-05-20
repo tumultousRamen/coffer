@@ -8,6 +8,7 @@ A Go/gRPC service that stores customer credentials for external storage provider
 - [ADRs](docs/adr/)
 - [Threat Model](docs/THREAT_MODEL.md)
 - [KMS Runbook](docs/RUNBOOK_KMS.md)
+- [Deployment Runbook](docs/runbook/deployment.md) — deploy to AWS ECS Fargate via Terraform + GitHub Actions
 
 ---
 
@@ -224,6 +225,8 @@ Byteport can swap any adapter — KMS, DB, provider, telemetry — by replacing 
 ## Local development
 
 Requires: Go 1.22+, Docker (for Postgres + Redis), AWS credentials (or skip with the `dev_no_kms` build tag), `protoc` or `buf` for regenerating gRPC bindings.
+
+To verify the full chain end-to-end against real Postgres + KMS + AWS S3, follow [docs/runbook/local-sanity.md](docs/runbook/local-sanity.md) — one-time setup is ~10 min, then `make sanity-test` walks the REST lifecycle in one command.
 
 ```bash
 # 1. Clone and bring up local infra
