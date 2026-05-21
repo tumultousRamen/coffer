@@ -183,6 +183,23 @@ resource "aws_secretsmanager_secret" "grant_pubkey" {
   tags                    = local.tags
 }
 
+# Dropbox OAuth app credentials. Vault registers the Dropbox provider iff
+# COFFER_DROPBOX_CLIENT_ID is non-empty at boot (cmd/vault/main.go).
+# Populate after apply: aws secretsmanager put-secret-value --secret-id coffer/dropbox-client-id ...
+resource "aws_secretsmanager_secret" "dropbox_client_id" {
+  name                    = "coffer/dropbox-client-id"
+  description             = "Dropbox OAuth app key. Maps to COFFER_DROPBOX_CLIENT_ID."
+  recovery_window_in_days = 0
+  tags                    = local.tags
+}
+
+resource "aws_secretsmanager_secret" "dropbox_client_secret" {
+  name                    = "coffer/dropbox-client-secret"
+  description             = "Dropbox OAuth app secret. Maps to COFFER_DROPBOX_CLIENT_SECRET."
+  recovery_window_in_days = 0
+  tags                    = local.tags
+}
+
 # ────────────────────────────────────────────────────────────────────
 # IAM roles
 # ────────────────────────────────────────────────────────────────────
@@ -220,6 +237,8 @@ data "aws_iam_policy_document" "task_execution_extra" {
     resources = [
       aws_secretsmanager_secret.pg_url.arn,
       aws_secretsmanager_secret.grant_pubkey.arn,
+      aws_secretsmanager_secret.dropbox_client_id.arn,
+      aws_secretsmanager_secret.dropbox_client_secret.arn,
     ]
   }
 }
@@ -506,6 +525,8 @@ resource "aws_ecs_task_definition" "vault" {
       secrets = [
         { name = "COFFER_PG_URL", valueFrom = aws_secretsmanager_secret.pg_url.arn },
         { name = "COFFER_GRANT_PUBKEY_PEM", valueFrom = aws_secretsmanager_secret.grant_pubkey.arn },
+        { name = "COFFER_DROPBOX_CLIENT_ID", valueFrom = aws_secretsmanager_secret.dropbox_client_id.arn },
+        { name = "COFFER_DROPBOX_CLIENT_SECRET", valueFrom = aws_secretsmanager_secret.dropbox_client_secret.arn },
       ]
 
       logConfiguration = {
