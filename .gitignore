@@ -23,3 +23,7 @@ scratch.md
 *.tfstate
 *.tfstate.backup
 *.tfstate.*.backup
+
+# Local demo runbook — reviewer-facing walkthrough with account-specific
+# URLs, IDs, and patter. Never committed; regenerate per environment.
+demo.md

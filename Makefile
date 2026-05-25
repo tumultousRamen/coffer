@@ -1,4 +1,4 @@
-.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check proto run keygen gen-keys mint-grant sanity-test docker-build docker-run
+.PHONY: smoke smoke-negative smoke-cleanup tidy test integration migrate-up migrate-down check-imports check proto run keygen gen-keys mint-grant sanity-test docker-build docker-run demo-s3 demo-worker demo-oauth-dropbox demo-oauth-box demo-oauth-gdrive demo-oauth
 
 # Run the smoke test. Expected: prints OK.
 smoke:
@@ -150,3 +150,31 @@ docker-run:
 	    -e AWS_PROFILE \
 	    -v $$HOME/.aws:/home/nonroot/.aws:ro \
 	    coffer-vault:latest'
+
+# ────────────────────────────────────────────────────────────────────
+# Demo runners — see demo.md (gitignored) for the patter.
+# All accept HOST=<url> override; default is http://localhost:8080.
+# Set GRPC=<host:port> override for the worker-fetch demo; default
+# is localhost:8443. Deployed: GRPC=<nlb-dns>:443.
+# ────────────────────────────────────────────────────────────────────
+
+# Phase 2-3: S3 lifecycle (POST/GET/PUT/DELETE, valid + garbage creds).
+demo-s3:
+	@bash scripts/demo/01-s3-lifecycle.sh $(if $(HOST),--host $(HOST))
+
+# Phase 4-5: worker gRPC fetch + end-to-end S3 access via returned plaintext.
+demo-worker:
+	@COFFER_GRPC_HOST=$(or $(GRPC),localhost:8443) bash scripts/demo/02-worker-fetch.sh $(if $(HOST),--host $(HOST))
+
+# Phase 6 slices: each OAuth provider's broker-mode lifecycle.
+demo-oauth-dropbox:
+	@bash scripts/demo/03-oauth-dropbox.sh $(if $(HOST),--host $(HOST))
+
+demo-oauth-box:
+	@COFFER_GRPC_HOST=$(or $(GRPC),localhost:8443) bash scripts/demo/04-oauth-box-rotation.sh $(if $(HOST),--host $(HOST))
+
+demo-oauth-gdrive:
+	@bash scripts/demo/05-oauth-gdrive.sh $(if $(HOST),--host $(HOST))
+
+# Run all three OAuth demos in sequence.
+demo-oauth: demo-oauth-dropbox demo-oauth-gdrive demo-oauth-box
