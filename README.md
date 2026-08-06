@@ -12,7 +12,26 @@ A Go/gRPC service that stores customer credentials for external storage provider
 
 ---
 
-## System Context
+## Status — what's built vs. what's designed
+
+The diagrams below are the **target architecture** described in the ADRs. Not all of it is implemented. What actually runs today:
+
+| Area | Built | Designed only |
+|---|---|---|
+| Core vault | Envelope encryption (AWS KMS + per-tenant DEK, AES-256-GCM with AAD), in-process DEK cache with single-flight, credential lifecycle | — |
+| Worker path | gRPC `GetCredentials` on `:8443`, ed25519 capability-token verification | mTLS |
+| User path | REST lifecycle served **directly by `cmd/vault`** on `:8080`, trial auth via `X-User-Id` header | Separate `cmd/gateway` binary with JWT verify, rate limiting, idempotency keys |
+| Providers | S3, Dropbox, Google Drive, Box; broker-mode OAuth with Refresh-as-probe on write | — |
+| OAuth refresh | **Sync-on-stale only** — refreshed inline on read, coalesced per credential with single-flight | Background refresh worker, `refresh_jobs` table, `SKIP LOCKED` claiming, leader election |
+| Datastore | Single Postgres (Supabase pooler in dev), `golang-migrate` embedded migrations — `tenants` + `credentials` | Aurora primary + per-region read replicas, primary-fallback-on-miss |
+| Cache | In-process LRU DEK cache | Redis / ElastiCache (no Redis dependency exists yet) |
+| Deploy | Terraform + GitHub Actions → ECS Fargate, single region | Multi-region topology |
+
+Read the ADRs as design rationale, not as a description of the running system.
+
+---
+
+## System Context (target architecture)
 
 ```mermaid
 flowchart LR
@@ -21,8 +40,8 @@ flowchart LR
     CP([Control Plane<br/>capability-token minter<br/><i>out of scope</i>])
 
     subgraph region["Region X (one of N)"]
-        Gateway["cmd/gateway<br/>JWT • rate-limit • idempotency"]
-        Vault["cmd/vault<br/>gRPC + REST<br/><i>refresh worker (in-process, leader-elected globally)</i>"]
+        Gateway["API gateway<br/>JWT • rate-limit • idempotency<br/><i>not built</i>"]
+        Vault["cmd/vault<br/>gRPC + REST<br/><i>+ refresh worker (leader-elected globally)</i>"]
         Replica[("Aurora<br/>regional read replica")]
         Redis[("Redis ×2<br/>no-evict + LRU<br/>ElastiCache")]
     end
@@ -92,7 +111,9 @@ Steady-state hot path = 1 SELECT against regional replica + 1 in-process AES-GCM
 
 ---
 
-## OAuth Refresh — Self-Scheduling Per-Credential Jobs
+## OAuth Refresh
+
+Only the **sync-on-stale** path (orange, below) is implemented. The background refresh worker and its `refresh_jobs` table are designed in [ADR 0006](docs/adr/0006-provider-adapter-and-refresh.md) but not built — shown here in blue for the intended end state.
 
 ```mermaid
 sequenceDiagram
@@ -106,12 +127,13 @@ sequenceDiagram
 
     U->>V: POST /v1/credentials (Dropbox)
     V->>V: encrypt secret with tenant DEK
+    V->>P: Refresh-as-probe (validates the refresh_token)
     V->>DB: INSERT credentials
-    V->>DB: INSERT refresh_jobs(run_at = expires_at - X)
     V-->>U: 201 Created
+    Note over V,DB: designed: also INSERT refresh_jobs(run_at = expires_at - X)
 
     rect rgba(200, 230, 255, 0.4)
-    Note over R,P: Primary path — background refresh (T-X before expiry)
+    Note over R,P: DESIGNED, NOT BUILT — background refresh (T-X before expiry)
     loop refresh tick
         R->>DB: SELECT FOR UPDATE SKIP LOCKED<br/>WHERE run_at <= now()
         DB-->>R: claim job
@@ -132,23 +154,24 @@ sequenceDiagram
     end
 
     rect rgba(255, 230, 200, 0.5)
-    Note over V,P: Safety-net path — sync-on-stale fallback (rare)
-    V->>V: GetCredentials sees expired access_token<br/>on credential row
+    Note over V,P: BUILT TODAY — sync-on-stale refresh, inline on read
+    V->>V: GetCredentials sees access_token within<br/>skew margin of expiry (from metadata)
+    V->>V: single-flight per user_id:credential_id<br/>(providers reject concurrent refreshes)
     V->>P: POST /oauth/token (refresh_token) — inline
     alt 200 OK
-        P-->>V: new access_token
-        V->>DB: BEGIN<br/>UPDATE credentials (re-encrypt)<br/>UPDATE refresh_jobs (run_at = new_expires - X)<br/>COMMIT
-        V-->>V: return fresh token to worker<br/>(blows 50ms SLO; lives in P99.9+)
+        P-->>V: new access_token<br/>(+ rotated refresh_token for Box)
+        V->>DB: UPDATE credentials — re-encrypted secret,<br/>new nonce, new metadata, one transaction
+        V-->>V: return fresh token to worker<br/>(blows 50ms SLO — lives in P99.9+)
     else 4xx invalid_grant
-        V->>DB: UPDATE credentials status='failed'<br/>DELETE refresh_jobs row
+        V->>DB: UPDATE credentials status='failed'
         V-->>V: return FAILED_PRECONDITION
     end
     end
 ```
 
-**Two paths.** The background refresh is the primary path — runs ahead of expiry, never blocks a worker, irrelevant to read SLO. The sync-on-stale fallback fires only when the refresh worker has fallen behind; it blows the 50ms read SLO on the path it triggers (Dropbox/Google `/oauth/token` is ~500ms) but should fire on <1% of reads, so the system-wide P99 holds. **Refresh-worker health is the load-bearing thing for the SLO** — `coffer_refresh_lag_seconds` is a first-class alert.
+**What runs today.** Every stale OAuth credential is refreshed inline on the read that discovers it. Staleness is read from the credential's metadata, so it costs no extra decrypt. Concurrent reads of the same credential collapse to one provider call via single-flight — Google and Box both reject concurrent refreshes of the same token, so this is a correctness requirement, not just an optimization. Rotated refresh tokens (Box rotates on every refresh) are persisted in the same transaction as the new access token; losing one orphans the credential permanently. `status='failed'` is the terminal state after `invalid_grant`.
 
-`run_at` is absolute (`new_expires_at - X`), not relative — prevents drift if a refresh runs late. Rotated refresh tokens are persisted in the same transaction as the new access token (load-bearing correctness invariant). `status='failed'` is the dead-letter state; no separate DLQ. See [ADR 0006](docs/adr/0006-provider-adapter-and-refresh.md).
+**The cost of it being the only path.** A refresh adds a `/oauth/token` round-trip — ~500ms for Dropbox/Google — to the read that triggers it, which blows the 50ms P99 budget on that read. With the background worker in place this fires on <1% of reads and the system-wide P99 holds; without it, the rate is however often credentials go stale between reads. `run_at` in the designed table is absolute (`new_expires_at - X`), not relative, so a late refresh doesn't drift. See [ADR 0006](docs/adr/0006-provider-adapter-and-refresh.md).
 
 ---
 
@@ -158,8 +181,8 @@ sequenceDiagram
 flowchart TB
     subgraph cmd["cmd/"]
         Main["vault/main.go<br/>composition root"]
-        Gw["gateway/<br/>stub API gateway"]
-        Migrate["coffer-migrate/<br/>data migration CLI"]
+        Migrate["migrate/<br/>migration CLI"]
+        Tools["keygen/ • mint-grant/<br/>smoketest/"]
     end
 
     subgraph transport["internal/transport/"]
@@ -187,9 +210,6 @@ flowchart TB
     Main --> Providers
     Main --> Tel
 
-    Gw -->|HTTP| Rest
-
-    Migrate --> AWS
     Migrate --> PG
 
     Grpc --> Service
@@ -202,80 +222,104 @@ flowchart TB
     Tel -.implements.-> Ports
 ```
 
-**Dependency direction is one-way.** `internal/vault` (core) imports nothing in `internal/adapters` or `internal/transport`. Adapters implement the port interfaces defined by core. `cmd/vault/main.go` is the only place where adapters get wired into the core service. The stub `cmd/gateway/` proxies HTTP into the vault's REST transport with JWT/idempotency middleware.
+**Dependency direction is one-way.** `internal/vault` (core) imports nothing in `internal/adapters` or `internal/transport`. Adapters implement the port interfaces defined by core. `cmd/vault/main.go` is the only place where adapters get wired into the core service. `make check-imports` enforces this and runs in CI.
 
-Byteport can swap any adapter — KMS, DB, provider, telemetry — by replacing one folder and re-wiring `main.go`. The core lifts cleanly into their monorepo as a library. See [ADR 0010](docs/adr/0010-modular-boundaries.md).
+Today `cmd/vault` serves both transports itself: gRPC on `:8443` for workers and the REST lifecycle on `:8080` for users, with trial-mode auth reading a pre-verified `X-User-Id` header. The separate gateway binary that would terminate JWTs and hold rate-limit / idempotency state is designed ([ADR 0007](docs/adr/0007-api-surface.md)) but not built.
+
+An integrator can swap any adapter — KMS, DB, provider, telemetry — by replacing one folder and re-wiring `main.go`. The core lifts cleanly into their monorepo as a library. See [ADR 0010](docs/adr/0010-modular-boundaries.md).
 
 ---
 
 ## Tech Stack
 
-| Layer | Choice |
-|---|---|
-| Language | Go |
-| Service interface | gRPC (worker-facing) + REST gateway (user-facing) |
-| Datastore | **AWS Aurora Postgres** — single primary + per-region read replicas ([ADR 0012](docs/adr/0012-multi-region-topology.md)) |
-| Migrations | `golang-migrate` with embedded SQL files |
-| Key management | AWS KMS (envelope encryption, per-tenant DEK, AES-256-GCM) |
-| Cache / supporting | Redis (rate limiting + idempotency keys only — no DEK cache, no OAuth-token cache) |
-| Observability | OpenTelemetry → Grafana |
+| Layer | Today | Target |
+|---|---|---|
+| Language | Go 1.26 | — |
+| Service interface | gRPC (workers, `:8443`) + REST (users, `:8080`), both from `cmd/vault` | REST fronted by a separate gateway binary |
+| Datastore | Single Postgres (Supabase pooler in dev, RDS/Aurora in deploy) | Aurora primary + per-region read replicas ([ADR 0012](docs/adr/0012-multi-region-topology.md)) |
+| Migrations | `golang-migrate` with embedded SQL files | — |
+| Key management | AWS KMS (envelope encryption, per-tenant DEK, AES-256-GCM) | — |
+| DEK cache | In-process LRU, single-flight, 5 min TTL ([ADR 0004](docs/adr/0004-dek-cache.md)) | — |
+| Rate limit / idempotency | Not implemented | Redis / ElastiCache, in the gateway |
+| Observability | OpenTelemetry traces + structured audit log | OTel → Grafana pipeline ([ADR 0009](docs/adr/0009-observability.md)) |
 
 ---
 
 ## Local development
 
-Requires: Go 1.22+, Docker (for Postgres + Redis), AWS credentials (or skip with the `dev_no_kms` build tag), `protoc` or `buf` for regenerating gRPC bindings.
-
-To verify the full chain end-to-end against real Postgres + KMS + AWS S3, follow [docs/runbook/local-sanity.md](docs/runbook/local-sanity.md) — one-time setup is ~10 min, then `make sanity-test` walks the REST lifecycle in one command.
+**Unit tests need nothing but Go.** Everything else needs real infrastructure — there is no docker-compose and no in-memory KMS fallback, so running the service locally means pointing it at a real Postgres and a real AWS KMS key.
 
 ```bash
-# 1. Clone and bring up local infra
-git clone https://github.com/<user>/coffer.git
+git clone https://github.com/tumultousRamen/coffer.git
 cd coffer
-docker compose up -d   # Postgres + Redis
+make test          # full unit suite, race detector on, no infra required
+make check         # test + hexagonal import boundary check (the CI gate)
+```
 
-# 2. Configure env
-cp .env.example .env
-# Edit .env: set COFFER_PG_URL, KMS settings (or use dev_no_kms below)
+### Running the service
 
-# 3. Run migrations
-go run ./cmd/coffer-migrate --migrate-only
+Requires: Go 1.26+, a Postgres database, an AWS account with a KMS key and credentials on the CLI. `protoc` plus the `protoc-gen-go` / `protoc-gen-go-grpc` plugins are only needed if you regenerate the gRPC bindings (`make proto`) — the generated `.pb.go` files are committed.
 
-# 4. Run the vault (with real KMS)
-go run ./cmd/vault
+[docs/runbook/local-sanity.md](docs/runbook/local-sanity.md) is the authoritative setup path — roughly 10 minutes one-time, and it covers provisioning the KMS key and the database.
 
-# 4b. Or run without AWS, using a file-based key for dev only
-go run -tags dev_no_kms ./cmd/vault
+```bash
+# 1. Configure env
+cp .env.local.example .env.local
+# Fill in DATABASE_URL, AWS_PROFILE, and the COFFER_* vars.
+# Every make target sources .env.local automatically.
 
-# 5. Run the stub gateway in another terminal
-go run ./cmd/gateway
+# 2. Generate the ed25519 keypair used to sign capability tokens in trial mode,
+#    then paste both PEM halves into .env.local as instructed by the template.
+make gen-keys
 
-# 6. Try it (against the gateway)
+# 3. Apply migrations (creates tenants + credentials)
+make migrate-up
+
+# 4. Boot the vault — gRPC on :8443, REST + /healthz + /readyz on :8080
+make run
+```
+
+With the vault running, in another terminal:
+
+```bash
+# Full REST lifecycle: POST → list → get → PUT → DELETE → expect 404
+bash examples/curl-demo.sh
+
+# Or a single request by hand. Trial-mode auth is the X-User-Id header —
+# the production gateway would JWT-verify and inject it. `secret` is
+# base64 of the raw secret bytes.
 curl -X POST localhost:8080/v1/credentials \
-  -H "Authorization: Bearer $(./scripts/mint-stub-jwt.sh)" \
-  -H "Idempotency-Key: $(uuidgen)" \
-  -d '{"provider":"s3","label":"demo","secret":{"access_key_id":"AKIA...","secret_access_key":"..."}}'
+  -H "X-User-Id: divya-demo" \
+  -H "Content-Type: application/json" \
+  -d "{\"provider\":\"s3\",\"label\":\"demo\",\"secret\":\"$(printf '%s' '{"access_key_id":"AKIAEXAMPLE","secret_access_key":"EXAMPLE"}' | base64)\",\"metadata\":{\"region\":\"us-west-1\"}}"
+
+# Mint a capability token for the worker-facing gRPC path
+make mint-grant USER=divya-demo IDS=<credential-id> TTL=15m
 ```
 
-### Running the demo end-to-end
+### Demo scripts
+
+`scripts/demo/` walks the load-bearing paths from the ADRs. Each accepts `HOST=` to run against a deployed instance instead of localhost.
 
 ```bash
-./demo/run.sh   # brings up infra, seeds creds, exercises worker fetch, refresh, and coffer-migrate
+make demo-s3       # S3 credential lifecycle, valid + garbage creds
+make demo-worker   # worker gRPC fetch, then real S3 access with the returned plaintext
+make demo-oauth    # Dropbox + Google Drive + Box broker-mode lifecycle and rotation
+make sanity-test   # scripted PASS/FAIL walk of the REST lifecycle
 ```
 
-Demo script intentionally exercises every load-bearing path from the ADRs in under 7 minutes — see [ADR 0011](docs/adr/0011-scope-and-build-order.md).
+### Integration tests
 
-### Testing
+Each adapter self-gates, so you can run a subset by exporting one env var:
 
 ```bash
-go test ./...                     # all unit tests
-go test -tags integration ./...   # adds testcontainers-backed integration tests
+make integration   # awskms (skips without AWS_PROFILE) + postgres (skips without DATABASE_URL) + providers
 ```
 
 Strict TDD applies to the core domain, crypto path, refresh state machine, and capability-token verification. Smoke tests cover the wiring. See [ADR 0011](docs/adr/0011-scope-and-build-order.md) §3.
 
 ---
 
-## Build & Demo
+## Design docs
 
-See [ADR 0011](docs/adr/0011-scope-and-build-order.md) for the day-by-day build plan and the demo script.
+[ADR 0011](docs/adr/0011-scope-and-build-order.md) records the scope decisions and build order — read it first if you want to know why something was cut. The [ADR index](docs/adr/) covers the rest: storage model, envelope-encryption shape, capability tokens, failure modes, observability, and multi-region topology.
